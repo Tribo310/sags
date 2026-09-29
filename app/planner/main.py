@@ -13,8 +13,10 @@ from app.common.db import audit, db, now
 from app.common.state import StateConflict, transition
 from app.planner import stores
 from app.planner.agent import run_agent
-from app.planner.checkout import checkout, undo
-from app.planner.mcp_client import Wallet, connect
+from app.planner.checkout import SoldOut, checkout, undo
+from app.planner.mcp_client import Wallet, call_json, connect
+
+REFILL_DAYS = 2  # suggest a refill when a pantry item lasts this many days or less
 
 
 @asynccontextmanager
@@ -53,6 +55,22 @@ async def index():
     return FileResponse(WEB)
 
 
+def sse(e):
+    return f"data: {json.dumps({k: v for k, v in e.items() if k != '_id'}, default=str, ensure_ascii=False)}\n\n"
+
+
+async def reopen(plan):
+    """The plan changes (user message or sold-out checkout): new version, the old approval is void."""
+    await transition(plan["_id"], plan["state"], "planning", version=plan["version"] + 1,
+                     basket=None, quotes=None, summary=None, branches=None, error=None)
+
+
+async def claim(pid):
+    """One agent loop per plan: a second message while it works would fork the conversation."""
+    return await db.plans.find_one_and_update({"_id": pid, "state": "planning", "running": {"$ne": True}},
+                                              {"$set": {"running": True}})
+
+
 @app.post("/chat")
 async def chat(body: ChatIn, bg: BackgroundTasks):
     if body.plan_id:
@@ -60,12 +78,9 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
         if not plan:
             raise HTTPException(404)
         pid = plan["_id"]
-        if plan["state"] in ("awaiting_approval", "failed"):  # user changes the plan -> new version, old approval void
-            await transition(pid, plan["state"], "planning", version=plan["version"] + 1,
-                             basket=None, quotes=None, summary=None, branches=None, error=None)
-        # One agent loop per plan: a second message while it works would fork the conversation.
-        if not await db.plans.find_one_and_update({"_id": pid, "state": "planning", "running": {"$ne": True}},
-                                                  {"$set": {"running": True}}):
+        if plan["state"] in ("awaiting_approval", "failed"):
+            await reopen(plan)
+        if not await claim(pid):
             raise HTTPException(409, "the agent is still working on this plan, or it can't be changed any more")
     else:
         pid = uuid.uuid4().hex
@@ -98,9 +113,6 @@ async def get_plan(pid: str):
 @app.get("/plans/{pid}/events")
 async def events(pid: str):
     """Replays the plan's audit log, then streams new entries live from a MongoDB change stream."""
-    def sse(e):
-        return f"data: {json.dumps({k: v for k, v in e.items() if k != '_id'}, default=str, ensure_ascii=False)}\n\n"
-
     async def gen():
         seen = set()
         async with await db.audit_log.watch([{"$match": {"operationType": "insert", "fullDocument.plan_id": pid}}]) as stream:
@@ -153,9 +165,29 @@ async def checkout_task(pid):
         async with connect() as mcp:
             receipts = await checkout(plan, stores.call, Wallet(mcp), logger(pid, "checkout"))
     except Exception as e:
-        await transition(pid, "checking_out", "failed", error=str(e))
+        plan = await transition(pid, "checking_out", "failed", error=str(e))
+        if isinstance(e, SoldOut):  # checkout already rolled back; let the agent fix the plan itself
+            await reopen(plan)
+            if await claim(pid):
+                await audit(pid, "system", "replan", result={"sold_out": e.name})
+                await agent_task(pid, f"[system] Checkout stopped: {e.name} is sold out at every store. Keep the rest of "
+                                      "the plan, replace that item or the recipes that use it, quote again and propose "
+                                      "the new plan. Reply in the user's language.")
         return
     await transition(pid, "checking_out", "completed", receipts=receipts)
+    await stock_pantry(plan["user_id"], receipts, 1)
+
+
+async def stock_pantry(user_id, receipts, sign):
+    """Bought groceries go into the pantry (sign=1) so the next list skips them; a refund takes them out (sign=-1)."""
+    lines = [l for r in receipts for l in r["lines"]]
+    packs = {p["key"]: p async for p in db.products.find({"key": {"$in": [l["key"] for l in lines]}}, {"key": 1, "pack": 1, "unit": 1})}
+    for l in lines:
+        p = packs[l["key"]]
+        await db.pantry.update_one({"user_id": user_id, "key": l["key"]}, [{"$set": {
+            "amount": {"$max": [0, {"$add": [{"$ifNull": ["$amount", 0]}, sign * l["qty"] * p["pack"]]}]},
+            "daily_use": {"$ifNull": ["$daily_use", 0]}, "name": {"$literal": l["name"]}, "unit": p["unit"], "updated": "$$NOW"}}],
+            upsert=True)
 
 
 @app.post("/plans/{pid}/cancel")
@@ -168,8 +200,46 @@ async def cancel(pid: str):
         receipts = plan.get("receipts", [])
         async with connect() as mcp:
             await undo(receipts, [r["payment_id"] for r in receipts], stores.call, Wallet(mcp), logger(pid, "cancel"))
+        await stock_pantry(plan["user_id"], receipts, -1)
     await transition(pid, plan["state"], "cancelled")
     return {"ok": True}
+
+
+async def mcp_tool(name, args):
+    async with connect() as mcp:
+        return await call_json(mcp, name, args)
+
+
+@app.get("/users/{uid}/stats")
+async def stats(uid: str):
+    return await mcp_tool("spending_stats", {"user_id": uid})
+
+
+@app.get("/users/{uid}/pantry")
+async def pantry(uid: str):
+    return await mcp_tool("get_pantry", {"user_id": uid})
+
+
+@app.post("/users/{uid}/pantry/tick")
+async def tick(uid: str):
+    """Demo: one day passes and the household eats its usual daily amounts (one pipeline update, no read-modify-write)."""
+    r = await db.pantry.update_many({"user_id": uid, "daily_use": {"$gt": 0}}, [{"$set": {
+        "amount": {"$max": [0, {"$subtract": ["$amount", "$daily_use"]}]}, "updated": "$$NOW"}}])
+    return {"updated": r.modified_count}
+
+
+@app.get("/users/{uid}/alerts")
+async def alerts(uid: str):
+    """Change stream on the pantry: pushes a refill suggestion once an item lasts REFILL_DAYS or less."""
+    async def gen():
+        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}}],
+                                         full_document="updateLookup") as stream:
+            async for ch in stream:
+                d = ch.get("fullDocument")
+                if d and d["user_id"] == uid and d.get("daily_use", 0) > 0 and d["amount"] <= REFILL_DAYS * d["daily_use"]:
+                    yield sse({"key": d["key"], "name": d["name"], "unit": d["unit"], "amount": round(d["amount"], 2),
+                               "days_left": round(d["amount"] / d["daily_use"], 1)})
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/stt")

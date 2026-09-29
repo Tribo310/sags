@@ -2,6 +2,13 @@ class CheckoutError(Exception):
     pass
 
 
+class SoldOut(CheckoutError):
+    """An item is out of stock at every store: the plan itself has to change."""
+    def __init__(self, name):
+        super().__init__(f"{name} is out of stock everywhere")
+        self.name = name
+
+
 def cheapest_other(quotes, key, exclude):
     offers = [(q[key]["price"], s) for s, q in quotes.items() if s not in exclude and key in q and q[key]["in_stock"]]
     return min(offers)[::-1] if offers else None  # (store, price)
@@ -55,10 +62,10 @@ async def checkout(plan, call_store, wallet, log):
                     continue
                 alt = cheapest_other(quotes, l["key"], tried | {store})
                 if alt is None:
-                    raise CheckoutError(f"{l['name']} is out of stock everywhere")
+                    raise SoldOut(l["name"])
                 s2, price = alt
                 moved.setdefault(s2, []).append({**l, "price": price, "line_total": price * l["qty"]})
-                await log("reroute", item=l["key"], from_store=store, to_store=s2, price=price)
+                await log("reroute", item=l["key"], name=l["name"], from_store=store, to_store=s2, price=price)
             queue += [(s2, ls, tried | {store}) for s2, ls in moved.items()]
 
         for o in orders:

@@ -5,10 +5,11 @@ from app.common.db import audit, db, now
 from app.common.optimizer import optimize
 from app.common.policy import check_items
 from app.common.state import transition
-from app.planner import stores
+from app.planner import script, stores
 from app.planner.mcp_client import call_json, connect
 
-LLM_TOOLS = {"get_profile", "search_recipes", "search_products", "build_list", "nearest_branches", "get_route"}
+LLM_TOOLS = {"get_profile", "search_recipes", "search_products", "build_list", "nearest_branches", "get_route",
+             "get_pantry", "set_pantry", "spending_stats"}
 MAX_STEPS = 20
 
 SYSTEM = """You are a grocery shopping agent for a household in Ulaanbaatar. Reply in the user's language (Mongolian or English).
@@ -18,10 +19,13 @@ Steps:
 2. search_recipes for suitable meals. Diet 'no_pork' -> exclude_tags ['pork']; 'vegetarian' -> pick only recipes tagged vegetarian.
    Plan breakfast, lunch and dinner for every requested day; cheap recipes may repeat.
 3. build_list with recipe ids and servings (servings = household size x number of times that meal is eaten).
+   It subtracts what is already at home (from_pantry). If the user says they have something, set_pantry first.
    If estimated_total > budget, swap expensive recipes for cheaper ones and rebuild.
 4. quote_stores with the list's items (key + qty). If over_budget or items are missing, change recipes and repeat.
 5. remember any lasting preference the user told you.
-6. propose_plan with a short summary: meals per day, where to buy, total vs budget, main trade-offs.
+6. propose_plan with a short summary: meals per day, where to buy, total vs budget, what the pantry covered, main trade-offs.
+If the user only wants specific products (e.g. a refill), skip recipes: search_products, then quote_stores with those keys.
+For questions about past spending use spending_stats.
 Never claim anything is ordered or paid. Checkout happens only after the user approves."""
 
 
@@ -66,6 +70,10 @@ async def quote_stores(ctx, items):
     for k in removed:
         needed.pop(k)
     best = optimize(needed, quotes, policy["max_stores"])
+    # Savings vs buying everything at the priciest store that has it all (never negative: single stores are candidates).
+    complete = [sum(q[k]["price"] * n for k, n in needed.items()) for q in quotes.values()
+                if all(k in q and q[k]["in_stock"] for k in needed)]
+    best["savings"] = max(complete) - best["total"] if complete else 0
     # Only a plan still being planned may change: never rewrite a basket the user is looking at or approved.
     r = await db.plans.update_one({"_id": ctx["plan_id"], "state": "planning"}, {"$set": {"quotes": quotes, "basket": best}})
     if not r.matched_count:
@@ -123,7 +131,7 @@ async def run_agent(plan_id, text):
                  for t in (await mcp.list_tools()).tools if t.name in LLM_TOOLS] + LOCAL_TOOLS
         ctx = {"plan_id": plan_id, "user": user, "mcp": mcp, "done": False}
         for _ in range(MAX_STEPS):
-            msg, model = await llm.chat(messages, tools)
+            msg, model = await (script.chat if script.ON else llm.chat)(messages, tools)
             messages.append(msg.model_dump(exclude_none=True))
             if not msg.tool_calls:
                 await audit(plan_id, "agent", "reply", result={"text": msg.content, "model": model})
