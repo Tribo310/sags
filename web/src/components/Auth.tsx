@@ -54,9 +54,9 @@ export default function Auth({ onDone }: { onDone: () => void }) {
     <main className="auth">
       <form className="card auth-card" onSubmit={submit}>
         <h1>Сагс</h1>
-        <div className="tabs" role="tablist">
+        <div className="tabs">
           {(["login", "register"] as const).map((m) => (
-            <button key={m} type="button" role="tab" aria-selected={mode === m} className={mode === m ? "" : "quiet"}
+            <button key={m} type="button" aria-pressed={mode === m} className={mode === m ? "" : "quiet"}
               onClick={() => { setMode(m); setError(""); }}>{m === "login" ? "Нэвтрэх" : "Бүртгүүлэх"}</button>
           ))}
         </div>

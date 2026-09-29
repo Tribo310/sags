@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { api, loggedOut, refresh } from "./api";
+import { api } from "./api";
 import type { AuditEvent, Plan } from "./types";
 
 /** Opens an SSE stream and hands every JSON message to onMessage (always the latest callback). */
@@ -19,10 +19,8 @@ export function useEventSource<T>(url: string | null, onMessage: (data: T) => vo
       es.onerror = () => {
         if (es.readyState !== EventSource.CLOSED || stopped || retried) return;
         retried = true;
-        refresh().then((ok) => {
-          if (!ok) loggedOut();
-          else if (!stopped) open();
-        });
+        // api.me refreshes on 401 and logs out only if that fails; a server that is merely down just stays closed.
+        api.me().then(() => { if (!stopped) open(); }, () => {});
       };
     };
     open();
