@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { api } from "./api";
+import { api, loggedOut, refresh } from "./api";
 import type { AuditEvent, Plan } from "./types";
 
 /** Opens an SSE stream and hands every JSON message to onMessage (always the latest callback). */
@@ -9,10 +9,24 @@ export function useEventSource<T>(url: string | null, onMessage: (data: T) => vo
   handlers.current = { onMessage, onOpen };
   useEffect(() => {
     if (!url) return;
-    const es = new EventSource(url);
-    es.onopen = () => handlers.current.onOpen?.();
-    es.onmessage = (e) => handlers.current.onMessage(JSON.parse(e.data));
-    return () => es.close();
+    let es: EventSource, stopped = false, retried = false;
+    const open = () => {
+      es = new EventSource(url);
+      es.onopen = () => { retried = false; handlers.current.onOpen?.(); };
+      es.onmessage = (e) => handlers.current.onMessage(JSON.parse(e.data));
+      // The browser retries dropped connections itself; an error answer (401: access token expired) closes the
+      // stream for good, so refresh once and reopen.
+      es.onerror = () => {
+        if (es.readyState !== EventSource.CLOSED || stopped || retried) return;
+        retried = true;
+        refresh().then((ok) => {
+          if (!ok) loggedOut();
+          else if (!stopped) open();
+        });
+      };
+    };
+    open();
+    return () => { stopped = true; es.close(); };
   }, [url]);
 }
 

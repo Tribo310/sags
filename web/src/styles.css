@@ -102,6 +102,20 @@ main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.
 .bars i { display: block; height: 6px; background: var(--blue); border-radius: 3px; margin-top: 2px; }
 .top-items { margin-top: 10px; }
 
+/* login / register */
+main.auth { display: flex; justify-content: center; align-items: flex-start; height: auto; padding: 48px 16px; }
+.auth-card { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 12px; font-size: 16px; }
+.auth-card h1 { margin: 0; font-size: 30px; letter-spacing: -.02em; }
+.auth-card label, .auth-card .label { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
+.auth-card input:not([type=checkbox]) { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; font-weight: 400; }
+.auth-card fieldset { display: flex; flex-wrap: wrap; gap: 16px; margin: 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.auth-card legend { font-weight: 500; padding: 0 4px; }
+.auth-card label.check { flex-direction: row; align-items: center; gap: 6px; font-weight: 400; }
+.auth-card .map { height: 200px; }
+.tabs { display: flex; gap: 4px; }
+.top .who { color: var(--mute); font-size: 14px; }
+button:disabled { opacity: .6; cursor: default; }
+
 @media (max-width: 860px) {
   main { grid-template-columns: minmax(0, 1fr); height: auto; padding: 12px 16px 16px; }  /* minmax(0,…): long content can't widen the page */
   .top { flex-wrap: wrap; padding: 16px 16px 4px; }
