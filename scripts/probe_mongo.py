@@ -20,16 +20,16 @@ async def main():
             {"type": "filter", "path": "store"},
         ]},
         name="vec", type="vectorSearch"))
-    r = []
     for _ in range(90):
-        r = await (await db.p.aggregate([
-            {"$vectorSearch": {"index": "vec", "path": "embedding", "queryVector": [0.9, 0.1, 0],
-                               "numCandidates": 10, "limit": 2, "filter": {"store": "a"}}},
-            {"$project": {"_id": 0, "name": 1}},
-        ])).to_list()
-        if r:
+        idx = await (await db.p.list_search_indexes("vec")).to_list()
+        if idx and idx[0].get("queryable"):
             break
         await asyncio.sleep(1)
+    r = await (await db.p.aggregate([
+        {"$vectorSearch": {"index": "vec", "path": "embedding", "queryVector": [0.9, 0.1, 0],
+                           "numCandidates": 10, "limit": 2, "filter": {"store": "a"}}},
+        {"$project": {"_id": 0, "name": 1}},
+    ])).to_list()
     print("vector:", r)
 
     async def txn(s):
