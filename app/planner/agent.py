@@ -11,6 +11,8 @@ from app.planner.mcp_client import call_json, connect
 LLM_TOOLS = {"get_profile", "search_recipes", "search_products", "build_list", "nearest_branches", "get_route",
              "get_pantry", "set_pantry", "spending_stats", "price_history"}
 MAX_STEPS = 20
+NUDGE = ("Don't write tool results yourself. Call the next tool now (get_profile, search_recipes, build_list, "
+         "quote_stores, propose_plan) and wait for its real result.")
 
 SYSTEM = """You are a grocery shopping agent for a household in Ulaanbaatar. Reply in the user's language (Mongolian or English).
 Goal: a meal plan and grocery list that fits the budget and diet, bought as cheaply as possible in at most policy.max_stores stores.
@@ -132,8 +134,17 @@ async def run_agent(plan_id, text):
                                                    "parameters": inline_refs(t.input_schema)}}
                  for t in (await mcp.list_tools()).tools if t.name in LLM_TOOLS] + LOCAL_TOOLS
         ctx = {"plan_id": plan_id, "user": user, "mcp": mcp, "done": False}
+        seen, nudges = set(), 0
         for _ in range(MAX_STEPS):
             msg, model = await (script.chat if script.ON else llm.chat)(messages, tools)
+            text = (msg.content or "").strip()
+            if not msg.tool_calls and (not text or text[0] in "[{" or "tool_response" in text) and nudges < 5:
+                # Small models sometimes stop mid-task with an empty reply, bare tool args or a made-up tool result
+                # (a real answer to the user is prose, never JSON); push them on
+                # instead of ending the run. The bad turn isn't kept: in the history the model keeps copying it.
+                nudges += 1
+                messages.append({"role": "user", "content": NUDGE})
+                continue
             messages.append(msg.model_dump(exclude_none=True))
             if not msg.tool_calls:
                 await audit(plan_id, "agent", "reply", result={"text": msg.content, "model": model})
@@ -142,7 +153,12 @@ async def run_agent(plan_id, text):
                 name, args = call.function.name, None
                 try:
                     args = json.loads(call.function.arguments or "{}")
-                    if name in LOCAL:
+                    sig = (name, json.dumps(args, sort_keys=True))
+                    if sig in seen:  # small models loop on a call that already succeeded
+                        result = {"error": f"{name} already done; don't call it again. Continue with the next step of "
+                                           "your instructions (get_profile, search_recipes, build_list, quote_stores, "
+                                           "propose_plan)."}
+                    elif name in LOCAL:
                         result = await LOCAL[name](ctx, **args)
                     elif name in LLM_TOOLS:
                         if "user_id" in args:  # the session's user, never one the LLM was talked into
@@ -150,6 +166,8 @@ async def run_agent(plan_id, text):
                         result = await call_json(mcp, name, args)
                     else:  # the LLM never gets wallet tools, even if it hallucinates them
                         result = {"error": f"unknown tool {name}"}
+                    if "error" not in result:
+                        seen.add(sig)
                 except Exception as e:
                     result = {"error": f"{type(e).__name__}: {e}"}
                 await audit(plan_id, "agent", name, args=args, result=result, reason=msg.content)
