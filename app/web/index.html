@@ -18,7 +18,9 @@ form{display:flex;gap:8px;margin-top:8px}input{flex:1;padding:10px;border:1px so
 button{padding:9px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}button.ghost{background:var(--line);color:var(--ink)}
 #timeline{font-size:13px;color:var(--mute);max-height:220px;overflow:auto;border-top:1px solid var(--line);margin-top:8px;padding-top:8px}
 #timeline b{color:var(--ink)}
-#right{display:grid;grid-template-rows:auto 280px auto;gap:12px}
+#right{display:grid;grid-template-rows:auto 280px auto auto;gap:12px}
+#home{font-size:14px;border-top:1px solid var(--line);padding-top:10px}#home h3{margin:6px 0}
+.bar{height:6px;background:var(--accent);border-radius:3px}.low{color:var(--warn);font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:14px}td{padding:4px 6px;border-bottom:1px solid var(--line)}td.n{text-align:right}
 #map{height:100%;border-radius:8px}.total{font-size:18px;font-weight:600}.over{color:var(--warn)}
 @media (max-width:800px){main{grid-template-columns:1fr;height:auto}}
@@ -37,12 +39,14 @@ table{width:100%;border-collapse:collapse;font-size:14px}td{padding:4px 6px;bord
   <div id="basket"><p style="color:var(--mute)">Төлөвлөгөө энд гарна.</p></div>
   <div id="map"></div>
   <div id="actions"></div>
+  <div id="home"></div>
  </section>
 </main>
 <script>
 const $ = s => document.querySelector(s);
 const fmt = n => Math.round(n).toLocaleString("mn-MN") + "₮";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const USER = "demo";
 let planId = null, plan = null, es = null, pending;
 
 const map = L.map("map").setView([47.918, 106.917], 12);
@@ -72,6 +76,11 @@ function listen() {
     const ev = JSON.parse(e.data);
     if (ev.actor === "user" && ev.action === "message") say(ev.args?.text, "user");
     if (ev.action === "reply" && ev.result?.text) say(ev.result.text, "agent");
+    const r = ev.result || {};
+    if (ev.action === "reroute")
+      say(`↪ ${r.name}: ${r.from_store} дээр дууссан → ${r.to_store}-оос ${fmt(r.price)}-өөр авна`, "agent");
+    if (ev.action === "replan") say(`🔄 ${r.sold_out} бүх дэлгүүрт дууссан. Төлөвлөгөөг шинэчилж байна…`, "agent");
+    if (ev.action === "state" && ["completed", "cancelled"].includes(r.to)) loadHome();
     const detail = ev.reason || (ev.result ? JSON.stringify(ev.result) : "");
     const row = document.createElement("div");
     row.innerHTML = `<b>${esc(ev.actor)} · ${esc(ev.action)}</b> ${esc(detail.slice(0, 160))}`;
@@ -93,6 +102,7 @@ function render() {
     }
     const over = plan.budget && b.total > plan.budget;
     h += `<p class="total ${over ? "over" : ""}">Нийт ${fmt(b.total)}${plan.budget ? " / " + fmt(plan.budget) : ""}</p>`;
+    if (b.savings) h += `<p>Хамгийн үнэтэй дэлгүүрээс ${fmt(b.savings)} хэмнэв.</p>`;
     if (b.missing?.length) h += `<p class=over>Олдсонгүй: ${esc(b.missing.join(", "))}</p>`;
   }
   for (const r of plan.receipts || [])
@@ -114,6 +124,37 @@ function render() {
     a.push(`<button class=ghost onclick="cancelPlan()">Цуцлах</button>`);
   $("#actions").innerHTML = a.join(" ");
 }
+
+async function loadHome() {
+  const [p, s] = await Promise.all([fetch(`/users/${USER}/pantry`), fetch(`/users/${USER}/stats`)].map(async f => (await f).json()));
+  let h = `<h3>Гэрт байгаа <button class=ghost onclick="tick()">⏭ Маргааш</button></h3><table>` + (p.pantry || []).map(i =>
+    `<tr><td>${esc(i.name)}</td><td class=n>${i.amount} ${esc(i.unit)}</td>` +
+    `<td class="n ${i.days_left !== null && i.days_left <= 2 ? "low" : ""}">${i.days_left ?? "–"} хоног</td></tr>`).join("") + "</table>";
+  const t = s.totals || {};
+  if (t.orders) {
+    const max = Math.max(...s.by_store.map(x => x.spent));
+    h += `<h3>Зарцуулалт</h3><p>${t.orders} захиалга · ${fmt(t.spent)} · хэмнэлт ${fmt(t.saved)}</p>` +
+      s.by_store.map(x => `<div>${esc(x.store)} ${fmt(x.spent)}<div class=bar style="width:${100 * x.spent / max}%"></div></div>`).join("");
+  }
+  $("#home").innerHTML = h;
+}
+
+async function tick() { await fetch(`/users/${USER}/pantry/tick`, {method: "POST"}); loadHome(); }
+
+// Pantry change stream: offer a refill once per item when it is about to run out.
+const offered = new Set();
+new EventSource(`/users/${USER}/alerts`).onmessage = e => {
+  const a = JSON.parse(e.data);
+  loadHome();
+  if (offered.has(a.key)) return;
+  offered.add(a.key);
+  say(`🔔 ${a.name} ${a.days_left} хоногийн дараа дуусна (${a.amount} ${a.unit} үлдсэн).`, "agent");
+  const btn = document.createElement("button");
+  btn.textContent = `${a.name} захиалах`;
+  btn.onclick = () => { btn.remove(); send(`${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.`); };
+  $("#chat").append(btn);
+};
+loadHome();
 
 async function errText(r) {
   try { return (await r.json()).detail ?? r.statusText; } catch { return r.statusText; }

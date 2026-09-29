@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Starts MCP server, 3 store agents and the planner. Ctrl-C stops all.
+# DEMO=1 ./run.sh  reseeds the DB and swaps the LLM for a deterministic script (app/planner/script.py).
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -f .env ] || { echo "missing .env: cp .env.example .env and fill it in"; exit 1; }
 R="uv run --env-file .env"
+if [ "${DEMO:-}" = 1 ]; then $R python -m seed.seed; fi
 trap 'kill 0' EXIT
 
 $R python -m app.mcp_server &

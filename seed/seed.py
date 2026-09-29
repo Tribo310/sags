@@ -14,6 +14,9 @@ STORES = {"nomin": 1.04, "emart": 0.98, "sansar": 1.0}  # store price level
 USER = {"_id": "demo", "name": "Demo household", "household": 2, "diet": ["no_pork"],
         "location": {"type": "Point", "coordinates": [106.9177, 47.9186]},  # Sukhbaatar square
         "wallet": 500000, "policy": DEFAULT_POLICY}
+# What the demo household has at home: key -> (amount in the product's unit, daily use).
+PANTRY = {"rice": (1.5, 0.1), "flour": (2, 0.15), "milk": (1.2, 0.4), "eggs": (6, 2), "oil": (0.5, 0.03),
+          "salt": (0.8, 0.01), "tea": (0.2, 0.02)}
 USER_SCHEMA = {"bsonType": "object", "required": ["household", "wallet", "location", "policy"], "properties": {
     "household": {"bsonType": "int", "minimum": 1},
     "wallet": {"bsonType": ["int", "long"], "minimum": 0},  # DB refuses a negative balance
@@ -48,7 +51,7 @@ async def main():
     recipes = json.loads((D / "recipes.json").read_text())
     branches = json.loads((D / "branches.json").read_text())
 
-    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory"):
+    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry"):
         await db.drop_collection(c)
 
     await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
@@ -68,6 +71,11 @@ async def main():
     await db.branches.insert_many([{**{k: v for k, v in b.items() if k != "lonlat"},
                                     "location": {"type": "Point", "coordinates": b["lonlat"]}} for b in branches])
 
+    by_key = {i["key"]: i for i in items}
+    await db.pantry.insert_many([{"user_id": USER["_id"], "key": k, "name": by_key[k]["name_mn"], "unit": by_key[k]["unit"],
+                                  "amount": amount, "daily_use": use} for k, (amount, use) in PANTRY.items()])
+
+    await db.pantry.create_index([("user_id", 1), ("key", 1)], unique=True)
     await db.products.create_index([("store", 1), ("key", 1)], unique=True)
     await db.products.create_index([("key", 1), ("price", 1)])
     await db.branches.create_index([("location", "2dsphere")])

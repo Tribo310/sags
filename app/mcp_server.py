@@ -92,19 +92,79 @@ async def build_list(user_id: str, meals: list[Meal]) -> dict:
         {"$set": {"servings": {"$arrayElemAt": [counts, {"$indexOfArray": [ids, "$_id"]}]}}},
         {"$unwind": "$ingredients"},
         {"$group": {"_id": "$ingredients.key", "amount": {"$sum": {"$multiply": ["$ingredients.qty", "$servings"]}}}},
+        # Subtract what is already at home.
+        {"$lookup": {"from": "pantry", "localField": "_id", "foreignField": "key",
+                     "pipeline": [{"$match": {"user_id": user_id}}], "as": "have"}},
+        {"$set": {"need": "$amount", "amount": {"$max": [0, {"$subtract": [
+            "$amount", {"$ifNull": [{"$first": "$have.amount"}, 0]}]}]}}},
         {"$lookup": {**CHEAPEST, "localField": "_id"}},
         {"$unwind": "$p"},
         {"$project": {"_id": 0, "key": "$_id", "name": "$p.name_mn", "category": "$p.category", "unit": "$p.unit",
                       "amount": {"$round": ["$amount", 2]},
+                      "from_pantry": {"$round": [{"$subtract": ["$need", "$amount"]}, 2]},
                       "qty": {"$toInt": {"$ceil": {"$round": [{"$divide": ["$amount", "$p.pack"]}, 6]}}},
                       "min_price": "$p.price"}},
         {"$set": {"est_cost": {"$multiply": ["$qty", "$min_price"]}}},
         {"$sort": {"est_cost": -1}},
     ])
+    pantry = [{"key": i["key"], "name": i["name"], "used": i["from_pantry"], "unit": i["unit"]}
+              for i in items if i["from_pantry"] > 0]
+    items = [i for i in items if i["qty"] > 0]
     found = await db.recipes.distinct("_id", {"_id": {"$in": ids}})
-    return {"items": items, "estimated_total": sum(i["est_cost"] for i in items),
+    return {"items": items, "from_pantry": pantry, "estimated_total": sum(i["est_cost"] for i in items),
             "budget": user["policy"]["budget"], "unknown_recipes": sorted(set(ids) - set(found)),
             "policy_violations": check_items(user["policy"], items)}
+
+
+@mcp.tool()
+async def get_pantry(user_id: str) -> dict:
+    """What the household has at home and how many days each item lasts at its usual daily use.
+    build_list already subtracts the pantry."""
+    return {"pantry": await agg(db.pantry, [
+        {"$match": {"user_id": user_id}},
+        {"$project": {"_id": 0, "key": 1, "name": 1, "unit": 1, "amount": {"$round": ["$amount", 2]},
+                      "days_left": {"$cond": [{"$gt": ["$daily_use", 0]},
+                                              {"$round": [{"$divide": ["$amount", "$daily_use"]}, 1]}, None]}}},
+        {"$sort": {"days_left": 1}},
+    ])}
+
+
+@mcp.tool()
+async def set_pantry(user_id: str, key: str, amount: float) -> dict:
+    """Record how much of a product is at home, in its unit (kg, l, pcs), e.g. after 'I have 2 kg rice'. 0 = none left."""
+    p = await db.products.find_one({"key": key}, {"name_mn": 1, "unit": 1})
+    if not p:
+        return {"error": f"unknown product {key}; use search_products to find keys"}
+    await db.pantry.update_one({"user_id": user_id, "key": key},
+                               {"$set": {"amount": max(0.0, amount), "name": p["name_mn"], "unit": p["unit"], "updated": now()},
+                                "$setOnInsert": {"daily_use": 0}}, upsert=True)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def spending_stats(user_id: str) -> dict:
+    """Spending of completed orders: totals, savings vs buying everything at the priciest store, per week, per store, top items."""
+    spent = {"$sum": "$receipts.total"}
+    r = await agg(db.plans, [
+        {"$match": {"user_id": user_id, "state": "completed"}},
+        {"$facet": {
+            "totals": [{"$group": {"_id": None, "orders": {"$sum": 1}, "spent": {"$sum": spent},
+                                   "saved": {"$sum": {"$ifNull": ["$basket.savings", 0]}}}},
+                       {"$project": {"_id": 0}}],
+            "by_week": [{"$group": {"_id": {"$dateTrunc": {"date": "$created", "unit": "week"}}, "spent": {"$sum": spent}}},
+                        {"$sort": {"_id": 1}}, {"$project": {"_id": 0, "week": "$_id", "spent": 1}}],
+            "by_store": [{"$unwind": "$receipts"},
+                         {"$group": {"_id": "$receipts.store", "spent": {"$sum": "$receipts.total"}}},
+                         {"$sort": {"spent": -1}}, {"$project": {"_id": 0, "store": "$_id", "spent": 1}}],
+            "top_items": [{"$unwind": "$receipts"}, {"$unwind": "$receipts.lines"},
+                          {"$group": {"_id": "$receipts.lines.name", "qty": {"$sum": "$receipts.lines.qty"},
+                                      "spent": {"$sum": "$receipts.lines.line_total"}}},
+                          {"$sort": {"spent": -1}}, {"$limit": 5}, {"$project": {"_id": 0, "name": "$_id", "qty": 1, "spent": 1}}],
+        }},
+    ])
+    r = r[0]
+    r["totals"] = r["totals"][0] if r["totals"] else {"orders": 0, "spent": 0, "saved": 0}
+    return r
 
 
 @mcp.tool()
