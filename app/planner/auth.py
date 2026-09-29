@@ -16,6 +16,8 @@ from app.common.db import db
 from app.common.policy import DEFAULT_POLICY
 
 SECRET = os.environ["JWT_SECRET"]  # no default: a guessable secret lets anyone sign in as anyone
+if len(SECRET) < 32:
+    raise SystemExit("JWT_SECRET must be at least 32 characters (see .env.example)")
 ACCESS_TTL = 15 * 60
 REFRESH_TTL = 7 * 24 * 3600
 SECURE = os.getenv("COOKIE_SECURE") == "1"
@@ -35,7 +37,7 @@ def verify_password(password, stored):
     try:
         _, salt, h = stored.split("$")
         return hmac.compare_digest(_scrypt(password, bytes.fromhex(salt)).hex(), h)
-    except ValueError:
+    except (ValueError, TypeError):  # malformed or non-ASCII stored hash
         return False
 
 
@@ -75,7 +77,7 @@ def current_user(access_token: Annotated[str | None, Cookie()] = None) -> str:
 class RegisterIn(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=254)
     password: str = Field(min_length=8, max_length=128)
-    name: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=80, pattern=r"\S")
     household: int = Field(ge=1, le=20)
     diet: list[Literal["no_pork", "vegetarian"]] = []
     budget: int = Field(ge=1000, le=10_000_000)
@@ -83,8 +85,8 @@ class RegisterIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=254)
+    password: str = Field(max_length=128)
 
 
 @router.post("/register")
