@@ -45,7 +45,7 @@ async def vector_search(index, query, limit, filter=None):
 @mcp.tool()
 async def get_profile(user_id: str) -> dict:
     """Household size, diet, home location, spending policy, wallet balance and remembered preferences."""
-    u = await db.users.find_one({"_id": user_id})
+    u = await db.users.find_one({"_id": user_id}, {"password": 0, "email": 0})  # never hand credentials to the LLM
     if not u:
         return {"error": f"unknown user {user_id}"}
     u["memory"] = [m["fact"] async for m in db.agent_memory.find({"user_id": user_id}).sort("ts", -1).limit(20)]
