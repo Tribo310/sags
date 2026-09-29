@@ -244,7 +244,7 @@ async def tick(uid: Uid):
 async def alerts(uid: Uid):
     """Change stream on the pantry: pushes a refill suggestion once an item lasts REFILL_DAYS or less."""
     async def gen():
-        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}}],
+        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}, "fullDocument.user_id": uid}}],
                                          full_document="updateLookup") as stream:
             async for ch in stream:
                 d = ch.get("fullDocument")

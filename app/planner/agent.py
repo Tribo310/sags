@@ -145,6 +145,8 @@ async def run_agent(plan_id, text):
                     if name in LOCAL:
                         result = await LOCAL[name](ctx, **args)
                     elif name in LLM_TOOLS:
+                        if "user_id" in args:  # the session's user, never one the LLM was talked into
+                            args["user_id"] = ctx["user"]["_id"]
                         result = await call_json(mcp, name, args)
                     else:  # the LLM never gets wallet tools, even if it hallucinates them
                         result = {"error": f"unknown tool {name}"}

@@ -134,5 +134,5 @@ export default function App() {
   if (user === undefined) return null;
   if (!user) return <Auth onDone={loadUser} />;
   // key: a different account starts with fresh chat/plan state
-  return <Home key={user._id} user={user} onLogout={() => api.logout().finally(() => setUser(null))} />;
+  return <Home key={user._id} user={user} onLogout={() => api.logout().catch(() => {}).then(() => setUser(null))} />;
 }
