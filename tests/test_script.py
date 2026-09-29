@@ -43,5 +43,12 @@ def test_walks_plan_and_requotes_without_sold_out_items():
 
 
 def test_stops_with_message_on_error():
-    calls, msg = run([{"household": 2}, {"recipes": RECIPES}, {"items": []}, {"error": "no store agent answered"}])
+    listed = {"items": [{"key": "egg", "qty": 2}]}
+    calls, msg = run([{"household": 2}, {"recipes": RECIPES}, listed, {"error": "no store agent answered"}])
     assert msg.content == "no store agent answered"
+
+
+def test_nothing_to_buy_when_pantry_covers_everything():
+    calls, msg = run([{"household": 2}, {"recipes": RECIPES}, {"items": [], "from_pantry": [{"key": "egg"}]}])
+    assert [n for n, _ in calls] == ["get_profile", "search_recipes", "build_list"]
+    assert "шаардлагагүй" in msg.content

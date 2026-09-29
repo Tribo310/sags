@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.common.db import audit, db, now
@@ -31,7 +32,9 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
-WEB = Path(__file__).parent.parent / "web" / "index.html"
+DIST = Path(__file__).parents[2] / "web" / "dist"  # built by `cd web && npm run build`
+if (DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
 
 
 @app.exception_handler(StateConflict)
@@ -52,7 +55,9 @@ class ApproveIn(BaseModel):
 
 @app.get("/")
 async def index():
-    return FileResponse(WEB)
+    if not (DIST / "index.html").exists():
+        raise HTTPException(503, "frontend is not built: cd web && npm install && npm run build")
+    return FileResponse(DIST / "index.html")
 
 
 def sse(e):
@@ -236,9 +241,12 @@ async def alerts(uid: str):
                                          full_document="updateLookup") as stream:
             async for ch in stream:
                 d = ch.get("fullDocument")
-                if d and d["user_id"] == uid and d.get("daily_use", 0) > 0 and d["amount"] <= REFILL_DAYS * d["daily_use"]:
+                if not d or d["user_id"] != uid or d.get("daily_use", 0) <= 0:
+                    continue
+                days = round(d["amount"] / d["daily_use"], 1)  # rounded like get_pantry, so 0.7999/0.4 counts as 2 days
+                if days <= REFILL_DAYS:
                     yield sse({"key": d["key"], "name": d["name"], "unit": d["unit"], "amount": round(d["amount"], 2),
-                               "days_left": round(d["amount"] / d["daily_use"], 1)})
+                               "days_left": days})
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
