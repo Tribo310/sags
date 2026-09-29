@@ -36,3 +36,8 @@ def test_check_items():
         {"key": "milk", "category": "dairy", "qty": 3},
     ])
     assert set(v) == {"vodka", "rice"}
+
+
+def test_non_positive_amount():
+    assert check_payment(DEFAULT_POLICY, PLAN, "nomin", 0, 0)
+    assert check_payment(DEFAULT_POLICY, PLAN, "nomin", -5000, 0)

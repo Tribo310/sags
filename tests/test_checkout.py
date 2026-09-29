@@ -14,8 +14,9 @@ PLAN = {"_id": "p1", "version": 1, "quotes": QUOTES, "basket": {"stores": {"nomi
 
 
 class FakeStores:
-    def __init__(self, out_of_stock=()):
-        self.oos, self.orders = set(out_of_stock), {}
+    def __init__(self, out_of_stock=(), place_fails=False, reserve_times_out=()):
+        self.oos, self.place_fails, self.timeout = set(out_of_stock), place_fails, set(reserve_times_out)
+        self.orders, self.by_key = {}, {}
 
     async def __call__(self, store, p):
         if p["skill"] == "reserve":
@@ -23,19 +24,23 @@ class FakeStores:
             if missing:
                 return {"ok": False, "missing": missing}
             oid = f"{store}-{len(self.orders)}"
-            self.orders[oid] = "reserved"
+            self.orders[oid], self.by_key[p["idempotency_key"]] = "reserved", oid
+            if store in self.timeout:  # store committed, but the reply never arrives
+                raise TimeoutError()
             return {"ok": True, "order_id": oid, "total": sum(QUOTES[store][i["key"]]["price"] * i["qty"] for i in p["items"])}
         if p["skill"] == "place_order":
+            if self.place_fails:
+                return {"ok": False, "error": "order is not reserved"}
             self.orders[p["order_id"]] = "placed"
             return {"ok": True, "store": store, "order_id": p["order_id"], "payment_id": p["payment_id"]}
         if p["skill"] == "cancel":
-            self.orders[p["order_id"]] = "cancelled"
+            self.orders[p.get("order_id") or self.by_key[p["idempotency_key"]]] = "cancelled"
             return {"ok": True}
 
 
 class FakeWallet:
-    def __init__(self, reject=False):
-        self.reject, self.p = reject, {}
+    def __init__(self, reject=False, refund_fails=False):
+        self.reject, self.refund_fails, self.p = reject, refund_fails, {}
 
     async def hold(self, plan_id, store, amount):
         if self.reject:
@@ -48,6 +53,8 @@ class FakeWallet:
         self.p[pid] = "captured"
 
     async def refund(self, pid):
+        if self.refund_fails:
+            raise CheckoutError("wallet down")
         self.p[pid] = "refunded"
 
 
@@ -86,3 +93,25 @@ def test_wallet_rejection_cancels_reservations():
     with pytest.raises(CheckoutError):
         run(stores, wallet)
     assert set(stores.orders.values()) == {"cancelled"}
+
+
+def test_failed_place_order_is_not_captured():
+    stores, wallet = FakeStores(place_fails=True), FakeWallet()
+    with pytest.raises(CheckoutError):
+        run(stores, wallet)
+    assert wallet.p == {"pay0": "refunded"}
+    assert set(stores.orders.values()) == {"cancelled"}
+
+
+def test_reserve_timeout_still_cancels_by_idempotency_key():
+    stores, wallet = FakeStores(reserve_times_out={"nomin"}), FakeWallet()
+    with pytest.raises(TimeoutError):
+        run(stores, wallet)
+    assert set(stores.orders.values()) == {"cancelled"}
+
+
+def test_undo_continues_past_failures():
+    stores, wallet = FakeStores(place_fails=True), FakeWallet(refund_fails=True)
+    with pytest.raises(CheckoutError):
+        run(stores, wallet)
+    assert set(stores.orders.values()) == {"cancelled"}  # cancel still ran after the refund failed

@@ -22,6 +22,8 @@ def check_items(policy, lines):
 def check_payment(policy, plan, store, amount, already_held):
     """Server-side guard for every wallet hold. Returns a list of violations (empty = allowed)."""
     v = []
+    if amount <= 0:
+        v.append(f"amount {amount} must be positive")
     if plan["state"] != "checking_out":
         v.append(f"plan is {plan['state']}, not checking_out")
     if plan.get("approved_version") != plan["version"]:

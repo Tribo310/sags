@@ -14,7 +14,7 @@ from a2a.server.routes import add_a2a_routes_to_fastapi, create_agent_card_route
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 
-from app.common.db import client, db, now
+from app.common.db import db, in_txn, now
 
 STORE = os.environ["STORE"]
 PORT = int(os.environ["PORT"])
@@ -63,8 +63,7 @@ async def reserve(d):
                                     "total": sum(l["line_total"] for l in lines), "status": "reserved",
                                     "created": now()}, session=s)
     try:
-        async with client.start_session() as s:
-            await s.with_transaction(txn)
+        await in_txn(txn)
     except OutOfStock as e:
         return {"ok": False, "missing": e.keys}
     except DuplicateKeyError:  # concurrent retry with the same key won the race
@@ -86,14 +85,16 @@ async def place_order(d):
 
 
 async def cancel(d):
+    """Cancel by order_id, or by idempotency_key when the planner never got the reserve reply."""
+    match = {"_id": d["order_id"]} if d.get("order_id") else {"idempotency_key": d["idempotency_key"]}
+
     async def txn(s):
-        o = await db.orders.find_one_and_update({"_id": d["order_id"], "status": {"$in": ["reserved", "placed"]}},
+        o = await db.orders.find_one_and_update({**match, "status": {"$in": ["reserved", "placed"]}},
                                                 {"$set": {"status": "cancelled"}}, session=s)
         for l in (o or {}).get("lines", []):
             await db.products.update_one({"store": STORE, "key": l["key"]}, {"$inc": {"stock": l["qty"]}}, session=s)
         return bool(o)
-    async with client.start_session() as s:
-        return {"ok": True, "cancelled": await s.with_transaction(txn)}
+    return {"ok": True, "cancelled": await in_txn(txn)}
 
 
 SKILLS = {"quote_basket": quote_basket, "reserve": reserve, "place_order": place_order, "cancel": cancel}
@@ -137,4 +138,4 @@ add_a2a_routes_to_fastapi(app, agent_card_routes=create_agent_card_routes(card),
                           jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/"))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=PORT)

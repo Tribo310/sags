@@ -7,6 +7,22 @@ def cheapest_other(quotes, key, exclude):
     return min(offers)[::-1] if offers else None  # (store, price)
 
 
+async def undo(orders, payments, call_store, wallet, log):
+    """Refund payments and cancel orders. Keeps going past individual failures so one bad call
+    doesn't leave the rest charged; failures are logged for manual follow-up."""
+    for p in payments:
+        try:
+            await wallet.refund(p)
+        except Exception as e:
+            await log("undo_failed", payment_id=p, error=str(e))
+    for o in orders:
+        try:  # an order whose reserve reply was lost is known only by its idempotency key
+            await call_store(o["store"], {"skill": "cancel", "order_id": o.get("order_id"),
+                                          "idempotency_key": o.get("idempotency_key")})
+        except Exception as e:
+            await log("undo_failed", store=o["store"], order_id=o.get("order_id"), error=str(e))
+
+
 async def checkout(plan, call_store, wallet, log):
     """Saga: reserve every store order (rerouting out-of-stock items to the next cheapest store),
     then hold -> place -> capture. Any failure compensates: refund payments, cancel reservations."""
@@ -17,12 +33,16 @@ async def checkout(plan, call_store, wallet, log):
         while queue:
             store, lines, tried = queue.pop(0)
             n += 1
-            r = await call_store(store, {"skill": "reserve", "plan_id": plan["_id"],
-                                         "idempotency_key": f"{plan['_id']}:v{plan['version']}:{n}",
-                                         "items": [{"key": l["key"], "qty": l["qty"]} for l in lines]})
+            key = f"{plan['_id']}:v{plan['version']}:{n}"
+            try:
+                r = await call_store(store, {"skill": "reserve", "plan_id": plan["_id"], "idempotency_key": key,
+                                             "items": [{"key": l["key"], "qty": l["qty"]} for l in lines]})
+            except Exception:
+                orders.append({"store": store, "idempotency_key": key})  # it may have committed: undo by key
+                raise
             await log("reserve", store=store, result=r)
             if r.get("ok"):
-                orders.append({"store": store, "order_id": r["order_id"], "total": r["total"]})
+                orders.append({"store": store, "order_id": r["order_id"], "idempotency_key": key, "total": r["total"]})
                 continue
             if "missing" not in r:
                 raise CheckoutError(f"{store}: {r.get('error')}")
@@ -45,13 +65,13 @@ async def checkout(plan, call_store, wallet, log):
             payments.append(await wallet.hold(plan["_id"], o["store"], o["total"]))
         receipts = []
         for o, p in zip(orders, payments):
-            receipts.append(await call_store(o["store"], {"skill": "place_order", "order_id": o["order_id"], "payment_id": p}))
+            r = await call_store(o["store"], {"skill": "place_order", "order_id": o["order_id"], "payment_id": p})
+            if not r.get("ok"):
+                raise CheckoutError(f"{o['store']}: {r.get('error')}")
             await wallet.capture(p)
+            receipts.append(r)
         return receipts
     except Exception as e:
         await log("compensate", reason=str(e))
-        for p in payments:
-            await wallet.refund(p)
-        for o in orders:
-            await call_store(o["store"], {"skill": "cancel", "order_id": o["order_id"]})
+        await undo(orders, payments, call_store, wallet, log)
         raise

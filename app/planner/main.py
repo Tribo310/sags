@@ -9,18 +9,22 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mcp import Client
-
 from app.common.db import audit, db, now
-from app.common.state import transition
+from app.common.state import StateConflict, transition
 from app.planner import stores
-from app.planner.agent import MCP_URL, mcp_json, run_agent
-from app.planner.checkout import CheckoutError, checkout
+from app.planner.agent import run_agent
+from app.planner.checkout import checkout, undo
+from app.planner.mcp_client import Wallet, connect
 
 
 @asynccontextmanager
 async def lifespan(app):
     print("store agents:", await stores.discover())
+    await db.plans.update_many({"running": True}, {"$set": {"running": False}})  # loops died with the old process
+    try:
+        await recover()
+    except Exception as e:
+        print(f"checkout recovery failed, will retry on next start: {e}")
     yield
 
 
@@ -28,7 +32,7 @@ app = FastAPI(lifespan=lifespan)
 WEB = Path(__file__).parent.parent / "web" / "index.html"
 
 
-@app.exception_handler(ValueError)  # illegal/raced state transitions
+@app.exception_handler(StateConflict)
 async def conflict(_, e):
     return JSONResponse({"detail": str(e)}, status_code=409)
 
@@ -44,26 +48,6 @@ class ApproveIn(BaseModel):
     confirm_high: bool = False
 
 
-class Wallet:
-    def __init__(self, mcp):
-        self.mcp = mcp
-
-    async def _call(self, name, **args):
-        d = await mcp_json(self.mcp, name, args)
-        if not d.get("ok"):
-            raise CheckoutError(f"{name}: {d.get('violations') or d.get('error')}")
-        return d
-
-    async def hold(self, plan_id, store, amount):
-        return (await self._call("wallet_hold", plan_id=plan_id, store=store, amount=amount))["payment_id"]
-
-    async def capture(self, payment_id):
-        await self._call("wallet_capture", payment_id=payment_id)
-
-    async def refund(self, payment_id):
-        await self._call("wallet_refund", payment_id=payment_id)
-
-
 @app.get("/")
 async def index():
     return FileResponse(WEB)
@@ -75,14 +59,17 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
         plan = await db.plans.find_one({"_id": body.plan_id})
         if not plan:
             raise HTTPException(404)
-        if plan["state"] in ("awaiting_approval", "failed"):  # user changes the plan -> new version, old approval void
-            await transition(plan["_id"], plan["state"], "planning", version=plan["version"] + 1)
-        elif plan["state"] != "planning":
-            raise HTTPException(409, f"plan is {plan['state']}")
         pid = plan["_id"]
+        if plan["state"] in ("awaiting_approval", "failed"):  # user changes the plan -> new version, old approval void
+            await transition(pid, plan["state"], "planning", version=plan["version"] + 1,
+                             basket=None, quotes=None, summary=None, branches=None, error=None)
+        # One agent loop per plan: a second message while it works would fork the conversation.
+        if not await db.plans.find_one_and_update({"_id": pid, "state": "planning", "running": {"$ne": True}},
+                                                  {"$set": {"running": True}}):
+            raise HTTPException(409, "the agent is still working on this plan, or it can't be changed any more")
     else:
         pid = uuid.uuid4().hex
-        await db.plans.insert_one({"_id": pid, "user_id": body.user_id, "state": "planning", "version": 1,
+        await db.plans.insert_one({"_id": pid, "user_id": body.user_id, "state": "planning", "version": 1, "running": True,
                                    "created": now(), "history": [{"state": "planning", "ts": now()}]})
     await audit(pid, "user", "message", args={"text": body.text})
     bg.add_task(agent_task, pid, body.text)
@@ -96,6 +83,8 @@ async def agent_task(pid, text):
         await audit(pid, "agent", "error", result={"error": f"{type(e).__name__}: {e}"})
         if (await db.plans.find_one({"_id": pid}))["state"] == "planning":
             await transition(pid, "planning", "failed", error=str(e))
+    finally:
+        await db.plans.update_one({"_id": pid}, {"$set": {"running": False}})
 
 
 @app.get("/plans/{pid}")
@@ -134,19 +123,35 @@ async def approve(pid: str, body: ApproveIn, bg: BackgroundTasks):
     if total > user["policy"]["approval_threshold"] and not body.confirm_high:
         return {"needs_second_confirm": True, "total": total}
     await audit(pid, "user", "approve", args={"version": body.version, "total": total})
-    await transition(pid, "awaiting_approval", "approved", approved_version=plan["version"], approved_total=total)
+    await transition(pid, "awaiting_approval", "approved", match={"version": body.version},
+                     approved_version=body.version, approved_total=total)
     bg.add_task(checkout_task, pid)
     return {"ok": True}
 
 
+def logger(pid, actor):
+    async def log(action, **kw):
+        await audit(pid, actor, action, result=kw)
+    return log
+
+
+async def recover():
+    """The planner died mid-checkout: undo whatever was reserved or paid and fail the plan."""
+    async for plan in db.plans.find({"state": "checking_out"}):
+        pid = plan["_id"]
+        orders = [{"store": o["store"], "order_id": o["_id"]}
+                  async for o in db.orders.find({"plan_id": pid, "status": {"$in": ["reserved", "placed"]}})]
+        payments = [p["_id"] async for p in db.payments.find({"plan_id": pid, "status": {"$in": ["held", "captured"]}})]
+        async with connect() as mcp:
+            await undo(orders, payments, stores.call, Wallet(mcp), logger(pid, "recovery"))
+        await transition(pid, "checking_out", "failed", error="planner restarted during checkout; payments refunded")
+
+
 async def checkout_task(pid):
     plan = await transition(pid, "approved", "checking_out")
-
-    async def log(action, **kw):
-        await audit(pid, "checkout", action, result=kw)
     try:
-        async with Client(MCP_URL) as mcp:
-            receipts = await checkout(plan, stores.call, Wallet(mcp), log)
+        async with connect() as mcp:
+            receipts = await checkout(plan, stores.call, Wallet(mcp), logger(pid, "checkout"))
     except Exception as e:
         await transition(pid, "checking_out", "failed", error=str(e))
         return
@@ -158,13 +163,11 @@ async def cancel(pid: str):
     plan = await db.plans.find_one({"_id": pid})
     if not plan:
         raise HTTPException(404)
-    if plan["state"] == "completed":
-        async with Client(MCP_URL) as mcp:
-            wallet = Wallet(mcp)
-            for r in plan.get("receipts", []):
-                await stores.call(r["store"], {"skill": "cancel", "order_id": r["order_id"]})
-                await wallet.refund(r["payment_id"])
     await audit(pid, "user", "cancel")
+    if plan["state"] == "completed":  # already paid: refund and restock
+        receipts = plan.get("receipts", [])
+        async with connect() as mcp:
+            await undo(receipts, [r["payment_id"] for r in receipts], stores.call, Wallet(mcp), logger(pid, "cancel"))
     await transition(pid, plan["state"], "cancelled")
     return {"ok": True}
 
@@ -172,6 +175,8 @@ async def cancel(pid: str):
 @app.post("/stt")
 async def stt(audio: UploadFile):
     # ADJUST to the OyuVoice API (Task 1 Step 3): endpoint, auth header, field name, response path.
+    if not os.getenv("OYUVOICE_URL"):
+        raise HTTPException(503, "voice input is not configured (OYUVOICE_URL)")
     async with httpx.AsyncClient(timeout=60) as h:
         r = await h.post(os.environ["OYUVOICE_URL"],
                          headers={"Authorization": f"Bearer {os.getenv('OYUVOICE_API_KEY', '')}"},

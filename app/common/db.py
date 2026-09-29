@@ -11,6 +11,16 @@ def now():
     return datetime.now(UTC)
 
 
+async def agg(coll, pipeline):
+    return await (await coll.aggregate(pipeline)).to_list()
+
+
+async def in_txn(fn):
+    """Run fn(session) in a transaction (retried on transient errors); returns fn's result."""
+    async with client.start_session() as s:
+        return await s.with_transaction(fn)
+
+
 async def audit(plan_id, actor, action, args=None, result=None, reason=None):
     await db.audit_log.insert_one({"ts": now(), "plan_id": plan_id, "actor": actor, "action": action,
                                    "args": args, "result": result, "reason": reason})

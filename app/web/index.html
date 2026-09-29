@@ -56,20 +56,21 @@ function say(text, who) {
 }
 
 async function send(text) {
-  say(text, "user");
   const reuse = plan && ["planning", "awaiting_approval", "failed"].includes(plan.state);
   const r = await fetch("/chat", {method: "POST", headers: {"content-type": "application/json"},
     body: JSON.stringify({text, plan_id: reuse ? planId : null})});
-  if (!r.ok) return say("Алдаа: " + await r.text(), "agent");
+  if (!r.ok) return say(text + "\n⚠ " + await errText(r), "agent");
   const {plan_id} = await r.json();
   if (plan_id !== planId) { planId = plan_id; listen(); }
 }
 
 function listen() {
-  es?.close(); $("#timeline").innerHTML = "";
+  es?.close();
   es = new EventSource(`/plans/${planId}/events`);
+  es.onopen = () => { $("#chat").innerHTML = ""; $("#timeline").innerHTML = ""; };  // server replays the full log
   es.onmessage = e => {
     const ev = JSON.parse(e.data);
+    if (ev.actor === "user" && ev.action === "message") say(ev.args?.text, "user");
     if (ev.action === "reply" && ev.result?.text) say(ev.result.text, "agent");
     const detail = ev.reason || (ev.result ? JSON.stringify(ev.result) : "");
     const row = document.createElement("div");
@@ -95,7 +96,7 @@ function render() {
     if (b.missing?.length) h += `<p class=over>Олдсонгүй: ${esc(b.missing.join(", "))}</p>`;
   }
   for (const r of plan.receipts || [])
-    h += `<p>🧾 ${esc(r.store)} #${esc(r.order_id.slice(0, 8))} · ${fmt(r.total)} · ${esc(r.status)} · авах хугацаа ${esc(r.pickup_by)}</p>`;
+    h += `<p>🧾 ${esc(r.store)} #${esc(String(r.order_id ?? "").slice(0, 8))} · ${fmt(r.total)} · ${esc(r.status)} · авах хугацаа ${esc(r.pickup_by)}</p>`;
   if (plan.error) h += `<p class=over>${esc(plan.error)}</p>`;
   if (h) $("#basket").innerHTML = h;
 
@@ -114,13 +115,22 @@ function render() {
   $("#actions").innerHTML = a.join(" ");
 }
 
+async function errText(r) {
+  try { return (await r.json()).detail ?? r.statusText; } catch { return r.statusText; }
+}
+
 async function approve(confirm_high = false) {
-  const r = await (await fetch(`/plans/${planId}/approve`, {method: "POST", headers: {"content-type": "application/json"},
-    body: JSON.stringify({version: plan.version, confirm_high})})).json();
+  const res = await fetch(`/plans/${planId}/approve`, {method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({version: plan.version, confirm_high})});
+  if (!res.ok) return say("⚠ " + await errText(res), "agent");
+  const r = await res.json();
   if (r.needs_second_confirm && confirm(`${fmt(r.total)} нь таны баталгаажуулах босгоос их байна. Үргэлжлүүлэх үү?`)) approve(true);
 }
 
-async function cancelPlan() { await fetch(`/plans/${planId}/cancel`, {method: "POST"}); }
+async function cancelPlan() {
+  const res = await fetch(`/plans/${planId}/cancel`, {method: "POST"});
+  if (!res.ok) say("⚠ " + await errText(res), "agent");
+}
 
 $("#f").onsubmit = e => {
   e.preventDefault();
@@ -140,7 +150,7 @@ $("#mic").onclick = async () => {
     const fd = new FormData();
     fd.append("audio", new Blob(chunks, {type: rec.mimeType}), "voice.webm");
     const r = await fetch("/stt", {method: "POST", body: fd});
-    if (!r.ok) return say("Дуу танихад алдаа: " + await r.text(), "agent");
+    if (!r.ok) return say("Дуу танихад алдаа: " + await errText(r), "agent");
     const {text} = await r.json();
     if (text) send(text);
   };

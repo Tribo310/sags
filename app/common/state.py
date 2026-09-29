@@ -13,19 +13,23 @@ ALLOWED = {
 }
 
 
+class StateConflict(Exception):
+    """Illegal transition, or the plan changed under us (another request won the race)."""
+
+
 def can(frm, to):
     return to in ALLOWED.get(frm, set())
 
 
-async def transition(plan_id, frm, to, **fields):
-    """Atomic compare-and-set on plan state; a concurrent change makes it fail instead of double-running."""
+async def transition(plan_id, frm, to, match=None, **fields):
+    """Atomic compare-and-set on plan state (plus any extra `match` filter, e.g. version)."""
     if not can(frm, to):
-        raise ValueError(f"illegal transition {frm} -> {to}")
+        raise StateConflict(f"illegal transition {frm} -> {to}")
     doc = await db.plans.find_one_and_update(
-        {"_id": plan_id, "state": frm},
+        {"_id": plan_id, "state": frm, **(match or {})},
         {"$set": {"state": to, **fields}, "$push": {"history": {"state": to, "ts": now()}}},
         return_document=ReturnDocument.AFTER)
     if doc is None:
-        raise ValueError(f"plan {plan_id} is not in state {frm}")
+        raise StateConflict(f"plan {plan_id} is no longer {frm} (changed concurrently)")
     await audit(plan_id, "system", "state", result={"from": frm, "to": to})
     return doc

@@ -1,7 +1,4 @@
 import json
-import os
-
-from mcp import Client
 
 from app.common import llm
 from app.common.db import audit, db, now
@@ -9,8 +6,8 @@ from app.common.optimizer import optimize
 from app.common.policy import check_items
 from app.common.state import transition
 from app.planner import stores
+from app.planner.mcp_client import call_json, connect
 
-MCP_URL = os.getenv("MCP_URL", "http://localhost:8100/mcp")
 LLM_TOOLS = {"get_profile", "search_recipes", "search_products", "build_list", "nearest_branches", "get_route"}
 MAX_STEPS = 20
 
@@ -26,6 +23,18 @@ Steps:
 5. remember any lasting preference the user told you.
 6. propose_plan with a short summary: meals per day, where to buy, total vs budget, main trade-offs.
 Never claim anything is ordered or paid. Checkout happens only after the user approves."""
+
+
+def inline_refs(schema, defs=None):
+    """Replace $ref/$defs with the referenced schema: local models' tool parsers often ignore $ref."""
+    defs = schema.get("$defs", {}) if defs is None else defs
+    if isinstance(schema, dict):
+        if "$ref" in schema:
+            return inline_refs(defs[schema["$ref"].split("/")[-1]], defs)
+        return {k: inline_refs(v, defs) for k, v in schema.items() if k != "$defs"}
+    if isinstance(schema, list):
+        return [inline_refs(v, defs) for v in schema]
+    return schema
 
 
 def fn(name, desc, props, required):
@@ -44,12 +53,6 @@ LOCAL_TOOLS = [
 ]
 
 
-async def mcp_json(mcp, name, args):
-    r = await mcp.call_tool(name, args)
-    text = r.content[0].text if r.content else "{}"
-    return {"ok": False, "error": text} if r.is_error else json.loads(text)
-
-
 async def quote_stores(ctx, items):
     policy = ctx["user"]["policy"]
     needed = {i["key"]: int(i["qty"]) for i in items}
@@ -63,7 +66,10 @@ async def quote_stores(ctx, items):
     for k in removed:
         needed.pop(k)
     best = optimize(needed, quotes, policy["max_stores"])
-    await db.plans.update_one({"_id": ctx["plan_id"]}, {"$set": {"quotes": quotes, "basket": best}})
+    # Only a plan still being planned may change: never rewrite a basket the user is looking at or approved.
+    r = await db.plans.update_one({"_id": ctx["plan_id"], "state": "planning"}, {"$set": {"quotes": quotes, "basket": best}})
+    if not r.matched_count:
+        return {"error": "plan is no longer being planned; stop"}
     return {"basket": best, "budget": policy["budget"], "over_budget": best["total"] > policy["budget"],
             "removed_by_policy": removed, "stores_answered": list(quotes),
             "full_basket_per_store": {s: sum(l["price"] * l["qty"] for l in q.values() if l["in_stock"])
@@ -80,10 +86,12 @@ async def propose_plan(ctx, summary, meals):
     if b["missing"]:
         return {"error": f"items {b['missing']} are not available; replace them"}
     lon, lat = ctx["user"]["location"]["coordinates"]
-    branches = (await mcp_json(ctx["mcp"], "nearest_branches", {"lon": lon, "lat": lat, "stores": list(b["stores"])}))["branches"]
+    # Map info is nice-to-have: a failed lookup must not block the proposal.
+    found = await call_json(ctx["mcp"], "nearest_branches", {"lon": lon, "lat": lat, "stores": list(b["stores"])})
+    branches = found.get("branches", [])
     for br in branches:
         to_lon, to_lat = br["location"]["coordinates"]
-        br["route"] = await mcp_json(ctx["mcp"], "get_route", {"from_lon": lon, "from_lat": lat, "to_lon": to_lon, "to_lat": to_lat})
+        br["route"] = await call_json(ctx["mcp"], "get_route", {"from_lon": lon, "from_lat": lat, "to_lon": to_lon, "to_lat": to_lat})
     await transition(ctx["plan_id"], "planning", "awaiting_approval", summary=summary, meals=meals,
                      branches=branches, budget=policy["budget"])
     await audit(ctx["plan_id"], "agent", "reply", result={"text": summary})
@@ -99,14 +107,19 @@ async def remember(ctx, fact):
 LOCAL = {"quote_stores": quote_stores, "propose_plan": propose_plan, "remember": remember}
 
 
+async def save(plan_id, messages):
+    """Persist the conversation after every step so a crash mid-run keeps the context for the next message."""
+    await db.plans.update_one({"_id": plan_id}, {"$set": {"messages": messages}})
+
+
 async def run_agent(plan_id, text):
     plan = await db.plans.find_one({"_id": plan_id})
     user = await db.users.find_one({"_id": plan["user_id"]})
     messages = plan.get("messages") or [{"role": "system", "content": f"{SYSTEM}\nuser_id: {user['_id']}"}]
     messages.append({"role": "user", "content": text})
-    async with Client(MCP_URL) as mcp:
+    async with connect() as mcp:
         tools = [{"type": "function", "function": {"name": t.name, "description": t.description or "",
-                                                   "parameters": t.input_schema}}
+                                                   "parameters": inline_refs(t.input_schema)}}
                  for t in (await mcp.list_tools()).tools if t.name in LLM_TOOLS] + LOCAL_TOOLS
         ctx = {"plan_id": plan_id, "user": user, "mcp": mcp, "done": False}
         for _ in range(MAX_STEPS):
@@ -122,7 +135,7 @@ async def run_agent(plan_id, text):
                     if name in LOCAL:
                         result = await LOCAL[name](ctx, **args)
                     elif name in LLM_TOOLS:
-                        result = await mcp_json(mcp, name, args)
+                        result = await call_json(mcp, name, args)
                     else:  # the LLM never gets wallet tools, even if it hallucinates them
                         result = {"error": f"unknown tool {name}"}
                 except Exception as e:
@@ -130,8 +143,9 @@ async def run_agent(plan_id, text):
                 await audit(plan_id, "agent", name, args=args, result=result, reason=msg.content)
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result, ensure_ascii=False, default=str)})
+            await save(plan_id, messages)
             if ctx["done"]:
                 break
         else:
             await audit(plan_id, "agent", "error", result={"error": f"gave up after {MAX_STEPS} steps"})
-    await db.plans.update_one({"_id": plan_id}, {"$set": {"messages": messages}})
+    await save(plan_id, messages)
