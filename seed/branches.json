@@ -1,0 +1,8 @@
+[
+  {"store": "nomin", "name": "Nomin — Center", "address": "Sukhbaatar district", "hours": "09:00-22:00", "lonlat": [106.9175, 47.9150]},
+  {"store": "nomin", "name": "Nomin — Khan-Uul", "address": "Khan-Uul district", "hours": "09:00-22:00", "lonlat": [106.8990, 47.8970]},
+  {"store": "emart", "name": "E-Mart — Chinggis", "address": "Chinggis Ave", "hours": "08:00-23:00", "lonlat": [106.9270, 47.9130]},
+  {"store": "emart", "name": "E-Mart — Khan-Uul", "address": "Khan-Uul district", "hours": "08:00-23:00", "lonlat": [106.8800, 47.8950]},
+  {"store": "sansar", "name": "Sansar — Sansar", "address": "Bayanzurkh district", "hours": "09:00-21:00", "lonlat": [106.9460, 47.9230]},
+  {"store": "sansar", "name": "Sansar — East", "address": "Bayanzurkh district", "hours": "09:00-21:00", "lonlat": [106.9650, 47.9180]}
+]
