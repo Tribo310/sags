@@ -1,5 +1,7 @@
+import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import uvicorn
@@ -14,7 +16,7 @@ from a2a.server.routes import add_a2a_routes_to_fastapi, create_agent_card_route
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 
-from app.common.db import db, in_txn, now
+from app.common.db import audit, db, in_txn, now
 
 STORE = os.environ["STORE"]
 PORT = int(os.environ["PORT"])
@@ -132,7 +134,34 @@ card = AgentCard(
         skill("cancel", "Cancel an order and restock: {order_id}."),
     ])
 
-app = FastAPI(title=f"{STORE} store agent")
+async def restock_expired():
+    """The TTL index deletes reservations nobody paid for; the delete's pre-image says what to put back on the shelf."""
+    # ponytail: no resume token, deletes while this agent is down are not restocked; store one if that matters.
+    while True:
+        try:
+            async with await db.orders.watch([{"$match": {"operationType": "delete", "fullDocumentBeforeChange.store": STORE}}],
+                                             full_document_before_change="required") as stream:
+                async for ch in stream:
+                    o = ch["fullDocumentBeforeChange"]
+
+                    async def txn(s):
+                        for l in o["lines"]:
+                            await db.products.update_one({"store": STORE, "key": l["key"]}, {"$inc": {"stock": l["qty"]}}, session=s)
+                    await in_txn(txn)
+                    await audit(o["plan_id"], STORE, "reservation_expired", result={"order_id": o["_id"], "total": o["total"]})
+        except Exception as e:
+            print(f"restock watcher: {type(e).__name__}: {e}; retrying")
+            await asyncio.sleep(2)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(restock_expired())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title=f"{STORE} store agent", lifespan=lifespan)
 handler = DefaultRequestHandler(agent_executor=StoreExecutor(), task_store=InMemoryTaskStore(), agent_card=card)
 add_a2a_routes_to_fastapi(app, agent_card_routes=create_agent_card_routes(card),
                           jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/"))
