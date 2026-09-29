@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 [ -f .env ] || { echo "missing .env: cp .env.example .env and fill it in"; exit 1; }
 R="uv run --env-file .env"
 if [ "${DEMO:-}" = 1 ]; then $R python -m seed.seed; fi
+[ -f web/dist/index.html ] || (cd web && npm install && npm run build)
 trap 'kill 0' EXIT
 
 $R python -m app.mcp_server &

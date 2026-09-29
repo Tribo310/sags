@@ -125,7 +125,9 @@ async def get_pantry(user_id: str) -> dict:
         {"$project": {"_id": 0, "key": 1, "name": 1, "unit": 1, "amount": {"$round": ["$amount", 2]},
                       "days_left": {"$cond": [{"$gt": ["$daily_use", 0]},
                                               {"$round": [{"$divide": ["$amount", "$daily_use"]}, 1]}, None]}}},
-        {"$sort": {"days_left": 1}},
+        {"$set": {"order": {"$ifNull": ["$days_left", 1e9]}}},  # soonest to run out first, no-daily-use items last
+        {"$sort": {"order": 1, "name": 1}},
+        {"$unset": "order"},
     ])}
 
 
@@ -146,7 +148,7 @@ async def spending_stats(user_id: str) -> dict:
     """Spending of completed orders: totals, savings vs buying everything at the priciest store, per week, per store, top items."""
     spent = {"$sum": "$receipts.total"}
     r = await agg(db.plans, [
-        {"$match": {"user_id": user_id, "state": "completed"}},
+        {"$match": {"user_id": user_id, "state": "completed", "receipts.0": {"$exists": True}}},
         {"$facet": {
             "totals": [{"$group": {"_id": None, "orders": {"$sum": 1}, "spent": {"$sum": spent},
                                    "saved": {"$sum": {"$ifNull": ["$basket.savings", 0]}}}},

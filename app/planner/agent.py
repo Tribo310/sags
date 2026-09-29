@@ -89,6 +89,8 @@ async def propose_plan(ctx, summary, meals):
     b, policy = plan.get("basket"), ctx["user"]["policy"]
     if not b:
         return {"error": "call quote_stores first"}
+    if not b["stores"]:
+        return {"error": "nothing to buy: the pantry already covers this plan. Tell the user instead of proposing an order."}
     if b["total"] > policy["budget"]:
         return {"error": f"total {b['total']} is over budget {policy['budget']}; change recipes"}
     if b["missing"]:

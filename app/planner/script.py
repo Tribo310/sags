@@ -9,6 +9,7 @@ from openai.types.chat import ChatCompletionMessage
 ON = os.getenv("DEMO") == "1"
 DAYS = 7
 MODEL = "demo-script"
+STORE_NAMES = {"nomin": "Номин", "emart": "Имарт", "sansar": "Сансар"}
 
 
 def call(name, **args):
@@ -60,21 +61,23 @@ async def chat(messages, tools):
     if "build_list" not in got:
         return call("build_list", user_id=user_id, meals=servings), MODEL
     listed = got["build_list"]
+    if not listed.get("items"):
+        return say(f"Гэрт байгаа хүнс {DAYS} хоногийн цэсэнд хүрэлцэнэ, одоогоор юу ч авах шаардлагагүй."), MODEL
     quotes = [r for n, r in done if n == "quote_stores"]
-    missing = quotes[-1].get("basket", {}).get("missing", []) if quotes else []
-    if not quotes or (missing and len(quotes) == 1):  # re-quote once without items no store has
+    dropped = quotes[0].get("basket", {}).get("missing", []) if quotes else []  # no store had these on the first quote
+    if not quotes or (dropped and len(quotes) == 1):  # re-quote once without them
         return call("quote_stores", items=[{"key": i["key"], "qty": i["qty"]} for i in listed["items"]
-                                           if i["key"] not in missing]), MODEL
+                                           if i["key"] not in dropped]), MODEL
     for r in (quotes[-1], got.get("propose_plan", {})):
         if r.get("error"):
             return say(r["error"]), MODEL
     b = quotes[-1]["basket"]
     text = (f"{DAYS} хоногийн төлөвлөгөө: {', '.join(sorted({m['recipe'] for m in meals}))}. "
-            f"{', '.join(b['stores'])} дэлгүүрээс нийт {b['total']:,}₮ / {quotes[-1]['budget']:,}₮.")
+            f"{', '.join(STORE_NAMES.get(s, s) for s in b['stores'])} дэлгүүрээс нийт {b['total']:,}₮ / {quotes[-1]['budget']:,}₮.")
     if listed.get("from_pantry"):
         text += f" Гэрт байгаа {len(listed['from_pantry'])} төрлийн барааг хасав."
     if b.get("savings"):
         text += f" Хамгийн үнэтэй дэлгүүрээс {b['savings']:,}₮ хямд."
-    if missing:
-        text += f" Дууссан тул хасав: {', '.join(missing)}."
+    if dropped:
+        text += f" Дууссан тул хасав: {', '.join(dropped)}."
     return call("propose_plan", summary=text, meals=meals), MODEL
