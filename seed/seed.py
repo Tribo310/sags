@@ -10,10 +10,12 @@ from pymongo.operations import SearchIndexModel
 from app.common.db import db, now
 from app.common.embed import DIMS, embed
 from app.common.policy import DEFAULT_POLICY
+from app.planner.auth import hash_password
 
 D = pathlib.Path(__file__).parent
 STORES = {"nomin": 1.04, "emart": 0.98, "sansar": 1.0}  # store price level
-USER = {"_id": "demo", "name": "Demo household", "household": 2, "diet": ["no_pork"],
+USER = {"_id": "demo", "name": "Demo household", "email": "demo@demo.mn", "password": hash_password("demo1234"),
+        "household": 2, "diet": ["no_pork"],
         "location": {"type": "Point", "coordinates": [106.9177, 47.9186]},  # Sukhbaatar square
         "wallet": 500000, "policy": DEFAULT_POLICY}
 # What the demo household has at home: key -> (amount in the product's unit, daily use).
@@ -21,7 +23,8 @@ PANTRY = {"rice": (1.5, 0.1), "flour": (2, 0.15), "milk": (1.2, 0.4), "eggs": (6
           "salt": (0.8, 0.01), "tea": (0.2, 0.02)}
 HISTORY_DAYS = 30
 RESERVE_TTL = int(os.getenv("RESERVE_TTL", "900"))  # unpaid reservations expire after this many seconds
-USER_SCHEMA = {"bsonType": "object", "required": ["household", "wallet", "location", "policy"], "properties": {
+USER_SCHEMA = {"bsonType": "object", "required": ["email", "password", "household", "wallet", "location", "policy"], "properties": {
+    "email": {"bsonType": "string"}, "password": {"bsonType": "string"},
     "household": {"bsonType": "int", "minimum": 1},
     "wallet": {"bsonType": ["int", "long"], "minimum": 0},  # DB refuses a negative balance
     "policy": {"bsonType": "object", "required": ["budget", "approval_threshold", "max_stores", "allowed_stores"],
@@ -63,6 +66,7 @@ async def main():
         await db.drop_collection(c)
 
     await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
+    await db.users.create_index("email", unique=True)
     await db.users.insert_one(USER)
 
     # Pre-images let change streams see the old price (price alerts) and deleted orders (expired reservations).

@@ -92,3 +92,23 @@ export interface ChatItem {
   warn?: boolean;
   action?: { label: string; send: string };
 }
+
+export interface User {
+  _id: string;
+  name: string;
+  email: string;
+  household: number;
+  diet: string[];
+  wallet: number;
+  policy: { budget: number };
+}
+
+export interface RegisterIn {
+  email: string;
+  password: string;
+  name: string;
+  household: number;
+  diet: string[];
+  budget: number;
+  location: [number, number];  // [lon, lat]
+}

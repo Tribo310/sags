@@ -4,9 +4,10 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Annotated
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,11 +16,13 @@ from app.common.db import agg, audit, db, now
 from app.common.state import StateConflict, transition
 from app.planner import stores
 from app.planner.agent import run_agent
+from app.planner.auth import current_user, router as auth_router
 from app.planner.checkout import SoldOut, checkout, undo
 from app.planner.mcp_client import Wallet, call_json, connect
 
 REFILL_DAYS = 2  # suggest a refill when a pantry item lasts this many days or less
 PRICE_DROP = 0.10  # alert when a price falls by at least this fraction
+Uid = Annotated[str, Depends(current_user)]
 
 
 @asynccontextmanager
@@ -34,6 +37,7 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(auth_router)
 DIST = Path(__file__).parents[2] / "web" / "dist"  # built by `cd web && npm run build`
 if (DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
@@ -46,7 +50,6 @@ async def conflict(_, e):
 
 class ChatIn(BaseModel):
     text: str
-    user_id: str = "demo"
     plan_id: str | None = None
 
 
@@ -78,12 +81,18 @@ async def claim(pid):
                                               {"$set": {"running": True}})
 
 
+async def own_plan(pid, uid, projection=None):
+    """The caller's plan; someone else's plan is a 404, same as a missing one."""
+    plan = await db.plans.find_one({"_id": pid, "user_id": uid}, projection)
+    if not plan:
+        raise HTTPException(404)
+    return plan
+
+
 @app.post("/chat")
-async def chat(body: ChatIn, bg: BackgroundTasks):
+async def chat(body: ChatIn, bg: BackgroundTasks, uid: Uid):
     if body.plan_id:
-        plan = await db.plans.find_one({"_id": body.plan_id})
-        if not plan:
-            raise HTTPException(404)
+        plan = await own_plan(body.plan_id, uid)
         pid = plan["_id"]
         if plan["state"] in ("awaiting_approval", "failed"):
             await reopen(plan)
@@ -91,7 +100,7 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
             raise HTTPException(409, "the agent is still working on this plan, or it can't be changed any more")
     else:
         pid = uuid.uuid4().hex
-        await db.plans.insert_one({"_id": pid, "user_id": body.user_id, "state": "planning", "version": 1, "running": True,
+        await db.plans.insert_one({"_id": pid, "user_id": uid, "state": "planning", "version": 1, "running": True,
                                    "created": now(), "history": [{"state": "planning", "ts": now()}]})
     await audit(pid, "user", "message", args={"text": body.text})
     bg.add_task(agent_task, pid, body.text)
@@ -110,16 +119,14 @@ async def agent_task(pid, text):
 
 
 @app.get("/plans/{pid}")
-async def get_plan(pid: str):
-    plan = await db.plans.find_one({"_id": pid}, {"messages": 0, "quotes": 0})
-    if not plan:
-        raise HTTPException(404)
-    return plan
+async def get_plan(pid: str, uid: Uid):
+    return await own_plan(pid, uid, {"messages": 0, "quotes": 0})
 
 
 @app.get("/plans/{pid}/events")
-async def events(pid: str):
+async def events(pid: str, uid: Uid):
     """Replays the plan's audit log, then streams new entries live from a MongoDB change stream."""
+    await own_plan(pid, uid, {"_id": 1})
     async def gen():
         seen = set()
         async with await db.audit_log.watch([{"$match": {"operationType": "insert", "fullDocument.plan_id": pid}}]) as stream:
@@ -133,9 +140,9 @@ async def events(pid: str):
 
 
 @app.post("/plans/{pid}/approve")
-async def approve(pid: str, body: ApproveIn, bg: BackgroundTasks):
-    plan = await db.plans.find_one({"_id": pid})
-    if not plan or plan["state"] != "awaiting_approval" or plan["version"] != body.version:
+async def approve(pid: str, body: ApproveIn, bg: BackgroundTasks, uid: Uid):
+    plan = await own_plan(pid, uid)
+    if plan["state"] != "awaiting_approval" or plan["version"] != body.version:
         raise HTTPException(409, "plan changed or is not awaiting approval")
     user = await db.users.find_one({"_id": plan["user_id"]})
     total = plan["basket"]["total"]
@@ -198,10 +205,8 @@ async def stock_pantry(user_id, receipts, sign):
 
 
 @app.post("/plans/{pid}/cancel")
-async def cancel(pid: str):
-    plan = await db.plans.find_one({"_id": pid})
-    if not plan:
-        raise HTTPException(404)
+async def cancel(pid: str, uid: Uid):
+    plan = await own_plan(pid, uid)
     await audit(pid, "user", "cancel")
     if plan["state"] == "completed":  # already paid: refund and restock
         receipts = plan.get("receipts", [])
@@ -217,29 +222,29 @@ async def mcp_tool(name, args):
         return await call_json(mcp, name, args)
 
 
-@app.get("/users/{uid}/stats")
-async def stats(uid: str):
+@app.get("/me/stats")
+async def stats(uid: Uid):
     return await mcp_tool("spending_stats", {"user_id": uid})
 
 
-@app.get("/users/{uid}/pantry")
-async def pantry(uid: str):
+@app.get("/me/pantry")
+async def pantry(uid: Uid):
     return await mcp_tool("get_pantry", {"user_id": uid})
 
 
-@app.post("/users/{uid}/pantry/tick")
-async def tick(uid: str):
+@app.post("/me/pantry/tick")
+async def tick(uid: Uid):
     """Demo: one day passes and the household eats its usual daily amounts (one pipeline update, no read-modify-write)."""
     r = await db.pantry.update_many({"user_id": uid, "daily_use": {"$gt": 0}}, [{"$set": {
         "amount": {"$max": [0, {"$subtract": ["$amount", "$daily_use"]}]}, "updated": "$$NOW"}}])
     return {"updated": r.modified_count}
 
 
-@app.get("/users/{uid}/alerts")
-async def alerts(uid: str):
+@app.get("/me/alerts")
+async def alerts(uid: Uid):
     """Change stream on the pantry: pushes a refill suggestion once an item lasts REFILL_DAYS or less."""
     async def gen():
-        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}}],
+        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}, "fullDocument.user_id": uid}}],
                                          full_document="updateLookup") as stream:
             async for ch in stream:
                 d = ch.get("fullDocument")
@@ -273,7 +278,7 @@ async def price_alerts():
 
 
 @app.post("/stt")
-async def stt(audio: UploadFile):
+async def stt(audio: UploadFile, _: Uid):
     # ADJUST to the OyuVoice API (Task 1 Step 3): endpoint, auth header, field name, response path.
     if not os.getenv("OYUVOICE_URL"):
         raise HTTPException(503, "voice input is not configured (OYUVOICE_URL)")

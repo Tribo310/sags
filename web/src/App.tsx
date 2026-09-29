@@ -1,7 +1,8 @@
 import { AnimatePresence, motion, MotionConfig } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, USER } from "./api";
+import { api } from "./api";
+import Auth from "./components/Auth";
 import Chat from "./components/Chat";
 import MapView from "./components/MapView";
 import Pantry from "./components/Pantry";
@@ -10,11 +11,11 @@ import Stats from "./components/Stats";
 import Timeline from "./components/Timeline";
 import { fmt, stateName, storeName } from "./i18n";
 import { useEventSource, usePlan } from "./hooks";
-import type { AuditEvent, ChatItem, PantryItem, PriceAlert, RefillAlert, Stats as StatsData } from "./types";
+import type { AuditEvent, ChatItem, PantryItem, PriceAlert, RefillAlert, Stats as StatsData, User } from "./types";
 
 const EDITABLE = ["planning", "awaiting_approval", "failed"];
 
-export default function App() {
+function Home({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [planId, setPlanId] = useState<string | null>(null);
   const [chat, setChat] = useState<ChatItem[]>([]);
   const [pantry, setPantry] = useState<PantryItem[]>([]);
@@ -44,7 +45,7 @@ export default function App() {
   const { plan, events } = usePlan(planId, onEvent, () => setChat([]));
 
   // Pantry change stream: offer a refill once per item when it is about to run out.
-  useEventSource<RefillAlert>(`/users/${USER}/alerts`, (a) => {
+  useEventSource<RefillAlert>("/me/alerts", (a) => {
     loadHome();
     if (offered.current.has(a.key)) return;
     offered.current.add(a.key);
@@ -99,6 +100,8 @@ export default function App() {
             </motion.span>
           </AnimatePresence>
         </motion.span>
+        <span className="who">{user.name}</span>
+        <button type="button" className="quiet" onClick={onLogout}>Гарах</button>
       </header>
       <main>
         <div className="col">
@@ -116,4 +119,20 @@ export default function App() {
       </main>
     </MotionConfig>
   );
+}
+
+export default function App() {
+  const [user, setUser] = useState<User | null | undefined>(undefined);  // undefined: still asking /auth/me
+  const loadUser = useCallback(() => api.me().then(setUser, () => setUser(null)), []);
+  useEffect(() => { loadUser(); }, [loadUser]);
+  useEffect(() => {
+    const out = () => setUser(null);
+    window.addEventListener("logout", out);
+    return () => window.removeEventListener("logout", out);
+  }, []);
+
+  if (user === undefined) return null;
+  if (!user) return <Auth onDone={loadUser} />;
+  // key: a different account starts with fresh chat/plan state
+  return <Home key={user._id} user={user} onLogout={() => api.logout().catch(() => {}).then(() => setUser(null))} />;
 }

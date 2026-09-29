@@ -65,3 +65,5 @@ export function describe(ev: AuditEvent): [string, string] {
 
 export const isFailure = (ev: AuditEvent) =>
   ev.action === "error" || ev.action === "hold_rejected" || (!!ev.result?.error && ev.action !== "reply");
+
+export const DIETS: Record<string, string> = { no_pork: "Гахайн мах иддэггүй", vegetarian: "Цагаан хоолтон" };
