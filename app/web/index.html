@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="mn">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Сагс · grocery agent</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{--bg:#f6f4ef;--card:#fff;--ink:#1d1d1b;--mute:#6b6b66;--accent:#1f6f4a;--warn:#b54708;--line:#e4e1d8}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center}
+header h1{font-size:18px;margin:0}#state{margin-left:auto;padding:3px 10px;border-radius:99px;background:var(--line);font-size:13px}
+main{display:grid;grid-template-columns:minmax(300px,1fr) 1.4fr;gap:16px;padding:16px 20px;height:calc(100vh - 56px)}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto}
+#left{display:flex;flex-direction:column}#chat{flex:1;overflow:auto}
+.msg{margin:8px 0;padding:8px 12px;border-radius:10px;max-width:90%;white-space:pre-wrap}.user{background:#e8f1ec;margin-left:auto}.agent{background:#f1efe9}
+form{display:flex;gap:8px;margin-top:8px}input{flex:1;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit}
+button{padding:9px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}button.ghost{background:var(--line);color:var(--ink)}
+#timeline{font-size:13px;color:var(--mute);max-height:220px;overflow:auto;border-top:1px solid var(--line);margin-top:8px;padding-top:8px}
+#timeline b{color:var(--ink)}
+#right{display:grid;grid-template-rows:auto 280px auto;gap:12px}
+table{width:100%;border-collapse:collapse;font-size:14px}td{padding:4px 6px;border-bottom:1px solid var(--line)}td.n{text-align:right}
+#map{height:100%;border-radius:8px}.total{font-size:18px;font-weight:600}.over{color:var(--warn)}
+@media (max-width:800px){main{grid-template-columns:1fr;height:auto}}
+</style>
+</head>
+<body>
+<header><h1>Сагс · grocery agent</h1><span id="state">—</span></header>
+<main>
+ <section id="left">
+  <div id="chat"></div>
+  <form id="f"><button type="button" id="mic" class="ghost" aria-label="Voice input">🎤</button>
+   <input id="t" placeholder="7 хоногийн хүнс, 150 мянга, 2 хүн..." autocomplete="off"><button>Илгээх</button></form>
+  <div id="timeline"></div>
+ </section>
+ <section id="right">
+  <div id="basket"><p style="color:var(--mute)">Төлөвлөгөө энд гарна.</p></div>
+  <div id="map"></div>
+  <div id="actions"></div>
+ </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const fmt = n => Math.round(n).toLocaleString("mn-MN") + "₮";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+let planId = null, plan = null, es = null, pending;
+
+const map = L.map("map").setView([47.918, 106.917], 12);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "© OpenStreetMap"}).addTo(map);
+const markers = L.layerGroup().addTo(map);
+
+function say(text, who) {
+  const d = document.createElement("div");
+  d.className = "msg " + who; d.textContent = text;
+  $("#chat").append(d); d.scrollIntoView();
+}
+
+async function send(text) {
+  say(text, "user");
+  const reuse = plan && ["planning", "awaiting_approval", "failed"].includes(plan.state);
+  const r = await fetch("/chat", {method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({text, plan_id: reuse ? planId : null})});
+  if (!r.ok) return say("Алдаа: " + await r.text(), "agent");
+  const {plan_id} = await r.json();
+  if (plan_id !== planId) { planId = plan_id; listen(); }
+}
+
+function listen() {
+  es?.close(); $("#timeline").innerHTML = "";
+  es = new EventSource(`/plans/${planId}/events`);
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.action === "reply" && ev.result?.text) say(ev.result.text, "agent");
+    const detail = ev.reason || (ev.result ? JSON.stringify(ev.result) : "");
+    const row = document.createElement("div");
+    row.innerHTML = `<b>${esc(ev.actor)} · ${esc(ev.action)}</b> ${esc(detail.slice(0, 160))}`;
+    $("#timeline").append(row); row.scrollIntoView({block: "nearest"});
+    clearTimeout(pending); pending = setTimeout(load, 300);
+  };
+}
+
+async function load() { plan = await (await fetch(`/plans/${planId}`)).json(); render(); }
+
+function render() {
+  $("#state").textContent = plan.state;
+  const b = plan.basket;
+  let h = plan.summary ? `<p>${esc(plan.summary)}</p>` : "";
+  if (b) {
+    for (const [store, lines] of Object.entries(b.stores)) {
+      h += `<h3>${esc(store)}</h3><table>` + lines.map(l =>
+        `<tr><td>${esc(l.name)}</td><td class=n>×${l.qty}</td><td class=n>${fmt(l.line_total)}</td></tr>`).join("") + "</table>";
+    }
+    const over = plan.budget && b.total > plan.budget;
+    h += `<p class="total ${over ? "over" : ""}">Нийт ${fmt(b.total)}${plan.budget ? " / " + fmt(plan.budget) : ""}</p>`;
+    if (b.missing?.length) h += `<p class=over>Олдсонгүй: ${esc(b.missing.join(", "))}</p>`;
+  }
+  for (const r of plan.receipts || [])
+    h += `<p>🧾 ${esc(r.store)} #${esc(r.order_id.slice(0, 8))} · ${fmt(r.total)} · ${esc(r.status)} · авах хугацаа ${esc(r.pickup_by)}</p>`;
+  if (plan.error) h += `<p class=over>${esc(plan.error)}</p>`;
+  if (h) $("#basket").innerHTML = h;
+
+  markers.clearLayers();
+  for (const br of plan.branches || []) {
+    const [lon, lat] = br.location.coordinates;
+    L.marker([lat, lon]).addTo(markers)
+      .bindPopup(`${esc(br.name)}<br>${br.route?.km ?? "?"} км · ${br.route?.minutes ?? "?"} мин`);
+  }
+  if (plan.branches?.length) map.fitBounds(markers.getLayers().map(m => m.getLatLng()), {padding: [30, 30]});
+
+  const a = [];
+  if (plan.state === "awaiting_approval") a.push(`<button onclick="approve()">Зөвшөөрөх ${fmt(b.total)}</button>`);
+  if (["awaiting_approval", "approved", "completed"].includes(plan.state))
+    a.push(`<button class=ghost onclick="cancelPlan()">Цуцлах</button>`);
+  $("#actions").innerHTML = a.join(" ");
+}
+
+async function approve(confirm_high = false) {
+  const r = await (await fetch(`/plans/${planId}/approve`, {method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({version: plan.version, confirm_high})})).json();
+  if (r.needs_second_confirm && confirm(`${fmt(r.total)} нь таны баталгаажуулах босгоос их байна. Үргэлжлүүлэх үү?`)) approve(true);
+}
+
+async function cancelPlan() { await fetch(`/plans/${planId}/cancel`, {method: "POST"}); }
+
+$("#f").onsubmit = e => {
+  e.preventDefault();
+  const t = $("#t").value.trim();
+  if (t) { $("#t").value = ""; send(t); }
+};
+
+let rec;
+$("#mic").onclick = async () => {
+  if (rec?.state === "recording") return rec.stop();
+  const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  const chunks = [];
+  rec = new MediaRecorder(stream);
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop()); $("#mic").textContent = "🎤";
+    const fd = new FormData();
+    fd.append("audio", new Blob(chunks, {type: rec.mimeType}), "voice.webm");
+    const r = await fetch("/stt", {method: "POST", body: fd});
+    if (!r.ok) return say("Дуу танихад алдаа: " + await r.text(), "agent");
+    const {text} = await r.json();
+    if (text) send(text);
+  };
+  rec.start(); $("#mic").textContent = "⏹";
+};
+</script>
+</body>
+</html>
