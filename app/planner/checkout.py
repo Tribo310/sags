@@ -1,5 +1,30 @@
+from app.agents.protocols.mcp import call_json
+
+
 class CheckoutError(Exception):
     pass
+
+
+class Wallet:
+    """Sandbox wallet over MCP. Raises CheckoutError when the server refuses (policy, balance)."""
+
+    def __init__(self, mcp):
+        self.mcp = mcp
+
+    async def _call(self, name, **args):
+        d = await call_json(self.mcp, name, args)
+        if not d.get("ok"):
+            raise CheckoutError(f"{name}: {d.get('violations') or d.get('error')}")
+        return d
+
+    async def hold(self, plan_id, store, amount):
+        return (await self._call("wallet_hold", plan_id=plan_id, store=store, amount=amount))["payment_id"]
+
+    async def capture(self, payment_id):
+        await self._call("wallet_capture", payment_id=payment_id)
+
+    async def refund(self, payment_id):
+        await self._call("wallet_refund", payment_id=payment_id)
 
 
 class SoldOut(CheckoutError):
@@ -43,6 +68,7 @@ async def checkout(plan, call_store, wallet, log):
             key = f"{plan['_id']}:v{plan['version']}:{n}"
             try:
                 r = await call_store(store, {"skill": "reserve", "plan_id": plan["_id"], "idempotency_key": key,
+                                             "offer_id": (plan.get("offers") or {}).get(store),
                                              "items": [{"key": l["key"], "qty": l["qty"]} for l in lines]})
             except Exception:
                 orders.append({"store": store, "idempotency_key": key})  # it may have committed: undo by key

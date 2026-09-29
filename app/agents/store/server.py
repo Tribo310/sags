@@ -1,3 +1,5 @@
+"""A2A store agent (run once per store: STORE=nomin PORT=9101). Stock and money skills are deterministic
+transactions; negotiate is the store's own LLM agent."""
 import asyncio
 import os
 import uuid
@@ -16,11 +18,12 @@ from a2a.server.routes import add_a2a_routes_to_fastapi, create_agent_card_route
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 
+from app.agents.store import negotiator
+from app.agents.store.negotiator import NAMES
 from app.common.db import audit, db, in_txn, now
 
 STORE = os.environ["STORE"]
 PORT = int(os.environ["PORT"])
-NAMES = {"nomin": "Nomin Supermarket", "emart": "E-Mart", "sansar": "Sansar Supermarket"}
 
 
 class OutOfStock(Exception):
@@ -45,6 +48,9 @@ async def reserve(d):
     if o := await db.orders.find_one({"idempotency_key": d["idempotency_key"]}):
         return {"ok": True, "order_id": o["_id"], "total": o["total"]}
     order_id = uuid.uuid4().hex
+    offer = d.get("offer_id") and await db.offers.find_one(
+        {"_id": d["offer_id"], "store": STORE, "plan_id": d["plan_id"], "expires": {"$gt": now()}})
+    prices = offer["prices"] if offer else {}  # the price this agent agreed to in negotiate
 
     async def txn(s):
         lines, missing = [], []
@@ -56,8 +62,9 @@ async def reserve(d):
             if not p:
                 missing.append(i["key"])
                 continue
-            lines.append({"key": p["key"], "name": p["name_mn"], "qty": qty, "price": p["price"],
-                          "line_total": p["price"] * qty})
+            price = prices.get(p["key"], p["price"])
+            lines.append({"key": p["key"], "name": p["name_mn"], "qty": qty, "price": price,
+                          "line_total": price * qty})
         if missing:
             raise OutOfStock(missing)  # aborts the transaction: no stock is taken
         await db.orders.insert_one({"_id": order_id, "store": STORE, "plan_id": d["plan_id"],
@@ -99,7 +106,13 @@ async def cancel(d):
     return {"ok": True, "cancelled": await in_txn(txn)}
 
 
-SKILLS = {"quote_basket": quote_basket, "reserve": reserve, "place_order": place_order, "cancel": cancel}
+
+async def negotiate(d):
+    """Counter-offer decided by this store's own sales agent (negotiator.py)."""
+    return await negotiator.negotiate(STORE, d)
+
+SKILLS = {"quote_basket": quote_basket, "negotiate": negotiate, "reserve": reserve, "place_order": place_order,
+          "cancel": cancel}
 
 
 class StoreExecutor(AgentExecutor):
@@ -129,7 +142,10 @@ card = AgentCard(
     default_input_modes=["application/json"], default_output_modes=["application/json"],
     skills=[
         skill("quote_basket", "Price and stock for {items:[{key,qty}]}"),
-        skill("reserve", "Atomically reserve stock: {plan_id, idempotency_key, items}. Returns order_id or missing keys."),
+        skill("negotiate", "Counter-offer for a basket, decided by this store's own agent: "
+              "{plan_id, items:[{key,qty}], competitor:{key: best other price}}. Returns offer_id, discounts, substitutes."),
+        skill("reserve", "Atomically reserve stock: {plan_id, idempotency_key, items, offer_id?}. "
+              "Uses the offer's prices. Returns order_id or missing keys."),
         skill("place_order", "Confirm a reserved order after payment: {order_id, payment_id}. Returns receipt."),
         skill("cancel", "Cancel an order and restock: {order_id}."),
     ])

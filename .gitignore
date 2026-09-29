@@ -4,3 +4,4 @@ __pycache__/
 docs/plans/
 web/node_modules/
 web/dist/
+evals/results/

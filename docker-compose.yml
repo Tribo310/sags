@@ -1,7 +1,7 @@
 services:
   mongo:
     image: mongodb/mongodb-atlas-local:latest
-    ports: ["27017:27017"]
+    ports: ["27018:27017"]
     volumes: [mongo-data:/data/db]
 volumes:
   mongo-data:

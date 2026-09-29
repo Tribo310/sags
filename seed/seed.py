@@ -57,12 +57,22 @@ async def search_index(coll, name, type, definition):
     raise RuntimeError(f"search index {name} never became queryable")
 
 
+async def reset_household():
+    """The demo household back to its seeded pantry, memory, wallet and policy (evals run each case from here)."""
+    by_key = {i["key"]: i for i in json.loads((D / "items.json").read_text())}
+    await db.pantry.delete_many({"user_id": USER["_id"]})
+    await db.pantry.insert_many([{"user_id": USER["_id"], "key": k, "name": by_key[k]["name_mn"], "unit": by_key[k]["unit"],
+                                  "amount": amount, "daily_use": use} for k, (amount, use) in PANTRY.items()])
+    await db.agent_memory.delete_many({"user_id": USER["_id"]})
+    await db.users.update_one({"_id": USER["_id"]}, {"$set": {"wallet": USER["wallet"], "policy": USER["policy"]}})
+
+
 async def main():
     items = json.loads((D / "items.json").read_text())
     recipes = json.loads((D / "recipes.json").read_text())
     branches = json.loads((D / "branches.json").read_text())
 
-    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry", "price_history"):
+    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry", "price_history", "offers"):
         await db.drop_collection(c)
 
     await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
@@ -96,9 +106,7 @@ async def main():
     await db.branches.insert_many([{**{k: v for k, v in b.items() if k != "lonlat"},
                                     "location": {"type": "Point", "coordinates": b["lonlat"]}} for b in branches])
 
-    by_key = {i["key"]: i for i in items}
-    await db.pantry.insert_many([{"user_id": USER["_id"], "key": k, "name": by_key[k]["name_mn"], "unit": by_key[k]["unit"],
-                                  "amount": amount, "daily_use": use} for k, (amount, use) in PANTRY.items()])
+    await reset_household()
 
     await db.pantry.create_index([("user_id", 1), ("key", 1)], unique=True)
     await db.products.create_index([("store", 1), ("key", 1)], unique=True)
@@ -107,6 +115,7 @@ async def main():
     await db.orders.create_index("idempotency_key", unique=True)
     await db.orders.create_index("created", expireAfterSeconds=RESERVE_TTL, partialFilterExpression={"status": "reserved"})
     await db.payments.create_index("plan_id")
+    await db.offers.create_index("expires", expireAfterSeconds=0)  # store offers lapse by themselves
     await db.audit_log.create_index([("plan_id", 1), ("ts", 1)])
     await db.agent_memory.create_index([("user_id", 1), ("ts", -1)])
     await vector_index(db.products, "products_vec", ["store"])

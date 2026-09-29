@@ -1,3 +1,4 @@
+"""A2A client: discovers the store agents from their agent cards and sends them tasks."""
 import asyncio
 import os
 
@@ -9,7 +10,9 @@ from a2a.types import Role, SendMessageRequest
 
 URLS = [u for u in os.getenv("STORE_AGENT_URLS", "http://localhost:9101,http://localhost:9102,http://localhost:9103").split(",") if u]
 AGENTS = {}  # store id (agent card name) -> A2A client
+SKILLS = {}  # store id -> skill ids its agent card advertises
 TIMEOUT = 20  # seconds; a reserve transaction can take a while
+NEGOTIATE_TIMEOUT = 60  # the store's own LLM takes a few steps
 
 
 def _ints(x):
@@ -33,11 +36,16 @@ async def discover():
                 print(f"A2A discovery failed for {url}: {e}")
                 continue
             if any(s.id == "quote_basket" for s in card.skills):
-                AGENTS[card.name] = await create_client(card, ClientConfig(httpx_client=httpx.AsyncClient(timeout=TIMEOUT)))
+                AGENTS[card.name] = await create_client(card, ClientConfig(httpx_client=httpx.AsyncClient(timeout=NEGOTIATE_TIMEOUT)))
+                SKILLS[card.name] = {s.id for s in card.skills}
     return list(AGENTS)
 
 
-async def call(store, payload):
+def can(store, skill):
+    return skill in SKILLS.get(store, ())
+
+
+async def call(store, payload, timeout=TIMEOUT):
     if store not in AGENTS:  # agent started late or restarted: look again
         await discover()
     if store not in AGENTS:
@@ -47,7 +55,7 @@ async def call(store, payload):
         msg = new_data_message(payload, role=Role.ROLE_USER)
         async for r in AGENTS[store].send_message(SendMessageRequest(message=msg)):
             return _ints(get_data_parts(r.message.parts)[0])
-    return await asyncio.wait_for(once(), TIMEOUT)
+    return await asyncio.wait_for(once(), timeout)
 
 
 async def quote_all(items):
