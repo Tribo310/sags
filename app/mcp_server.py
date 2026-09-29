@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import timedelta
 
 import httpx
 from pydantic import BaseModel
@@ -28,13 +29,17 @@ class Refused(Exception):
     pass
 
 
-async def vector_search(index, query, limit, filter=None):
+async def vector_stage(index, query, limit, filter=None):
     limit = max(1, min(int(limit), 50))  # the LLM picks limit; keep it sane
     stage = {"index": index, "path": "embedding", "queryVector": (await embed([query]))[0],
              "numCandidates": limit * 10, "limit": limit}
     if filter:
         stage["filter"] = filter
-    return [{"$vectorSearch": stage}, {"$set": {"score": {"$meta": "vectorSearchScore"}}}]
+    return {"$vectorSearch": stage}
+
+
+async def vector_search(index, query, limit, filter=None):
+    return [await vector_stage(index, query, limit, filter), {"$set": {"score": {"$meta": "vectorSearchScore"}}}]
 
 
 @mcp.tool()
@@ -66,9 +71,17 @@ async def search_recipes(query: str, exclude_tags: list[str] | None = None, limi
 
 @mcp.tool()
 async def search_products(query: str, limit: int = 5) -> dict:
-    """Semantic product search across all stores; returns item keys usable in a shopping list."""
+    """Product search across all stores (meaning + typo-tolerant text); returns item keys usable in a shopping list."""
+    n = max(1, min(int(limit), 50)) * 3
     return {"products": await agg(db.products, [
-        *await vector_search("products_vec", query, limit * 3),
+        # Hybrid: reciprocal rank fusion of vector search (meaning) and fuzzy Atlas Search (spelling, exact names).
+        {"$rankFusion": {"input": {"pipelines": {
+            "vector": [await vector_stage("products_vec", query, n)],
+            "text": [{"$search": {"index": "products_text", "text": {
+                "query": query, "path": ["name_mn", "name_en", "category"], "fuzzy": {"maxEdits": 2}}}},
+                     {"$limit": n}]}}}},
+        {"$limit": n},
+        {"$set": {"score": {"$meta": "score"}}},
         {"$group": {"_id": "$key", "name": {"$first": "$name_mn"}, "category": {"$first": "$category"},
                     "unit": {"$first": "$unit"}, "pack": {"$first": "$pack"},
                     "min_price": {"$min": "$price"}, "score": {"$max": "$score"}}},
@@ -167,6 +180,22 @@ async def spending_stats(user_id: str) -> dict:
     r = r[0]
     r["totals"] = r["totals"][0] if r["totals"] else {"orders": 0, "spent": 0, "saved": 0}
     return r
+
+
+@mcp.tool()
+async def price_history(key: str, days: int = 30) -> dict:
+    """Price trend of one product per store over the last days (time-series): current, min, avg, max,
+    and whether today's price is the lowest of the period. Use for 'is now a good time to buy X?'."""
+    since = now() - timedelta(days=max(1, min(int(days), 365)))
+    return {"key": key, "stores": await agg(db.price_history, [
+        {"$match": {"meta.key": key, "ts": {"$gte": since}}},
+        {"$sort": {"ts": 1}},
+        {"$group": {"_id": "$meta.store", "current": {"$last": "$price"}, "min": {"$min": "$price"},
+                    "avg": {"$avg": "$price"}, "max": {"$max": "$price"}, "points": {"$sum": 1}}},
+        {"$project": {"_id": 0, "store": "$_id", "current": 1, "min": 1, "max": 1, "points": 1,
+                      "avg": {"$round": ["$avg", 0]}, "lowest_in_period": {"$lte": ["$current", "$min"]}}},
+        {"$sort": {"current": 1}},
+    ])}
 
 
 @mcp.tool()

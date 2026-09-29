@@ -9,7 +9,7 @@ from app.planner import script, stores
 from app.planner.mcp_client import call_json, connect
 
 LLM_TOOLS = {"get_profile", "search_recipes", "search_products", "build_list", "nearest_branches", "get_route",
-             "get_pantry", "set_pantry", "spending_stats"}
+             "get_pantry", "set_pantry", "spending_stats", "price_history"}
 MAX_STEPS = 20
 
 SYSTEM = """You are a grocery shopping agent for a household in Ulaanbaatar. Reply in the user's language (Mongolian or English).
@@ -25,7 +25,7 @@ Steps:
 5. remember any lasting preference the user told you.
 6. propose_plan with a short summary: meals per day, where to buy, total vs budget, what the pantry covered, main trade-offs.
 If the user only wants specific products (e.g. a refill), skip recipes: search_products, then quote_stores with those keys.
-For questions about past spending use spending_stats.
+For questions about past spending use spending_stats. For price trends or "is now a good time to buy" use price_history.
 Never claim anything is ordered or paid. Checkout happens only after the user approves."""
 
 

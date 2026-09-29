@@ -13,7 +13,7 @@ app/
   planner/       FastAPI app: agent loop, A2A client, checkout saga, MCP client
   web/           single-page UI
 seed/            catalog, recipes, branches + seed.py
-scripts/         probes, e2e demo, chaos (force out-of-stock)
+scripts/         probes, e2e demo, chaos (force out-of-stock), price (change a price -> alert)
 tests/           pure-logic tests (no services needed)
 ```
 
@@ -30,3 +30,6 @@ uv run --env-file .env python -m seed.seed
 uv run python scripts/demo_e2e.py # end-to-end check
 uv run pytest -q
 ```
+
+Demo price drop: `uv run --env-file .env python -m scripts.price emart milk 3000` (alert in chat).
+Unpaid reservations expire after `RESERVE_TTL` seconds (default 900, set at seed) and are restocked.

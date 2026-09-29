@@ -6,5 +6,5 @@ const planner = "http://localhost:8000";
 
 export default defineConfig({
   plugins: [react()],
-  server: { proxy: Object.fromEntries(["/chat", "/plans", "/users", "/stt"].map((p) => [p, planner])) },
+  server: { proxy: Object.fromEntries(["/chat", "/plans", "/users", "/stt", "/price-alerts"].map((p) => [p, planner])) },
 });

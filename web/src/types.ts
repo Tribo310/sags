@@ -75,6 +75,16 @@ export interface RefillAlert {
   days_left: number;
 }
 
+export interface PriceAlert {
+  store: string;
+  key: string;
+  name: string;
+  old: number;
+  new: number;
+  pct: number;
+  lowest_30d: boolean;
+}
+
 export interface ChatItem {
   id: number;
   who: "user" | "agent";

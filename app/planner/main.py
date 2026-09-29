@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -10,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.common.db import audit, db, now
+from app.common.db import agg, audit, db, now
 from app.common.state import StateConflict, transition
 from app.planner import stores
 from app.planner.agent import run_agent
@@ -18,6 +19,7 @@ from app.planner.checkout import SoldOut, checkout, undo
 from app.planner.mcp_client import Wallet, call_json, connect
 
 REFILL_DAYS = 2  # suggest a refill when a pantry item lasts this many days or less
+PRICE_DROP = 0.10  # alert when a price falls by at least this fraction
 
 
 @asynccontextmanager
@@ -247,6 +249,26 @@ async def alerts(uid: str):
                 if days <= REFILL_DAYS:
                     yield sse({"key": d["key"], "name": d["name"], "unit": d["unit"], "amount": round(d["amount"], 2),
                                "days_left": days})
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/price-alerts")
+async def price_alerts():
+    """Change stream on product prices; the pre-image gives the old price. Pushes drops of PRICE_DROP or more."""
+    async def gen():
+        async with await db.products.watch(
+                [{"$match": {"operationType": "update", "updateDescription.updatedFields.price": {"$exists": True}}}],
+                full_document_before_change="whenAvailable") as stream:
+            async for ch in stream:
+                old, new = ch.get("fullDocumentBeforeChange"), ch["updateDescription"]["updatedFields"]["price"]
+                if not old or new > old["price"] * (1 - PRICE_DROP):
+                    continue
+                lows = await agg(db.price_history, [{"$match": {"meta.key": old["key"], "meta.store": old["store"],
+                                                                 "ts": {"$gte": now() - timedelta(days=30)}}},
+                                                     {"$group": {"_id": None, "min": {"$min": "$price"}}}])
+                yield sse({"store": old["store"], "key": old["key"], "name": old["name_mn"], "old": old["price"], "new": new,
+                           "pct": round(100 * (1 - new / old["price"])),
+                           "lowest_30d": bool(lows) and new <= lows[0]["min"]})
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 

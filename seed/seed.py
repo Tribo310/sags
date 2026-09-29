@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
 import json
+import os
 import pathlib
+from datetime import timedelta
 
 from pymongo.operations import SearchIndexModel
 
-from app.common.db import db
+from app.common.db import db, now
 from app.common.embed import DIMS, embed
 from app.common.policy import DEFAULT_POLICY
 
@@ -17,6 +19,8 @@ USER = {"_id": "demo", "name": "Demo household", "household": 2, "diet": ["no_po
 # What the demo household has at home: key -> (amount in the product's unit, daily use).
 PANTRY = {"rice": (1.5, 0.1), "flour": (2, 0.15), "milk": (1.2, 0.4), "eggs": (6, 2), "oil": (0.5, 0.03),
           "salt": (0.8, 0.01), "tea": (0.2, 0.02)}
+HISTORY_DAYS = 30
+RESERVE_TTL = int(os.getenv("RESERVE_TTL", "900"))  # unpaid reservations expire after this many seconds
 USER_SCHEMA = {"bsonType": "object", "required": ["household", "wallet", "location", "policy"], "properties": {
     "household": {"bsonType": "int", "minimum": 1},
     "wallet": {"bsonType": ["int", "long"], "minimum": 0},  # DB refuses a negative balance
@@ -35,9 +39,13 @@ def store_price(base, key, store):
 
 
 async def vector_index(coll, name, filters):
-    await coll.create_search_index(SearchIndexModel(name=name, type="vectorSearch", definition={"fields": [
+    await search_index(coll, name, "vectorSearch", {"fields": [
         {"type": "vector", "path": "embedding", "numDimensions": DIMS, "similarity": "cosine"},
-        *({"type": "filter", "path": f} for f in filters)]}))
+        *({"type": "filter", "path": f} for f in filters)]})
+
+
+async def search_index(coll, name, type, definition):
+    await coll.create_search_index(SearchIndexModel(name=name, type=type, definition=definition))
     for _ in range(120):
         idx = await (await coll.list_search_indexes(name)).to_list()
         if idx and idx[0].get("queryable"):
@@ -51,17 +59,30 @@ async def main():
     recipes = json.loads((D / "recipes.json").read_text())
     branches = json.loads((D / "branches.json").read_text())
 
-    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry"):
+    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry", "price_history"):
         await db.drop_collection(c)
 
     await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
     await db.users.insert_one(USER)
+
+    # Pre-images let change streams see the old price (price alerts) and deleted orders (expired reservations).
+    for c in ("products", "orders"):
+        await db.create_collection(c, changeStreamPreAndPostImages={"enabled": True})
+    await db.create_collection("price_history", timeseries={"timeField": "ts", "metaField": "meta", "granularity": "hours"})
 
     vecs = await embed([f"{i['name_mn']} {i['name_en']} {i['category']}" for i in items])
     await db.products.insert_many([
         {**i, "_id": f"{s}:{i['key']}", "store": s, "price": store_price(i["price"], i["key"], s),
          "stock": int(jitter(f"{i['key']}:{s}:stock", 5, 60)), "embedding": v}
         for s in STORES for i, v in zip(items, vecs)])
+
+    # Daily price history ending at today's price, drifting up to +-8% a day before.
+    t = now().replace(minute=0, second=0, microsecond=0)
+    await db.price_history.insert_many([
+        {"ts": t - timedelta(days=d), "meta": {"store": s, "key": i["key"]},
+         "price": store_price(i["price"], i["key"], s) if d == 0 else
+         round(store_price(i["price"], i["key"], s) * jitter(f"{i['key']}:{s}:{d}", 0.92, 1.08) / 10) * 10}
+        for s in STORES for i in items for d in range(HISTORY_DAYS)])
 
     vecs = await embed([f"{r['name_mn']} {r['name_en']} {' '.join(r['tags'])} "
                         f"{' '.join(g['key'] for g in r['ingredients'])}" for r in recipes])
@@ -80,11 +101,14 @@ async def main():
     await db.products.create_index([("key", 1), ("price", 1)])
     await db.branches.create_index([("location", "2dsphere")])
     await db.orders.create_index("idempotency_key", unique=True)
+    await db.orders.create_index("created", expireAfterSeconds=RESERVE_TTL, partialFilterExpression={"status": "reserved"})
     await db.payments.create_index("plan_id")
     await db.audit_log.create_index([("plan_id", 1), ("ts", 1)])
     await db.agent_memory.create_index([("user_id", 1), ("ts", -1)])
     await vector_index(db.products, "products_vec", ["store"])
     await vector_index(db.recipes, "recipes_vec", ["tags"])
+    await search_index(db.products, "products_text", "search", {"mappings": {"dynamic": False, "fields": {
+        f: {"type": "string"} for f in ("name_mn", "name_en", "category")}}})
     print(f"seeded {len(items) * len(STORES)} products, {len(recipes)} recipes, {len(branches)} branches")
 
 

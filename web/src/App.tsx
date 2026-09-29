@@ -10,7 +10,7 @@ import Stats from "./components/Stats";
 import Timeline from "./components/Timeline";
 import { fmt, stateName, storeName } from "./i18n";
 import { useEventSource, usePlan } from "./hooks";
-import type { AuditEvent, ChatItem, PantryItem, RefillAlert, Stats as StatsData } from "./types";
+import type { AuditEvent, ChatItem, PantryItem, PriceAlert, RefillAlert, Stats as StatsData } from "./types";
 
 const EDITABLE = ["planning", "awaiting_approval", "failed"];
 
@@ -51,6 +51,15 @@ export default function App() {
     say({
       who: "agent", text: `${a.name} ${a.days_left} хоногийн дараа дуусна, ${a.amount} ${a.unit} үлдсэн.`,
       action: { label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` },
+    });
+  });
+
+  // Price change stream: a store cut a price by 10% or more.
+  useEventSource<PriceAlert>("/price-alerts", (a) => {
+    say({
+      who: "agent",
+      text: `${a.name} ${storeName(a.store)}-д ${a.pct}% хямдарлаа: ${fmt(a.old)} → ${fmt(a.new)}.${a.lowest_30d ? " Сүүлийн 30 хоногийн хамгийн бага үнэ." : ""}`,
+      action: { label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` },
     });
   });
 
