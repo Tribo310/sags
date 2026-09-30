@@ -198,6 +198,17 @@ async def checkout_task(pid):
         return
     await transition(pid, "checking_out", "completed", receipts=receipts)
     await stock_pantry(plan["user_id"], receipts, 1)
+    await pickup_trip(pid, plan["user_id"], [r["store"] for r in receipts])
+
+
+async def pickup_trip(pid, user_id, stores):
+    """The drive to collect the orders: home -> every store that got one -> home. Nice-to-have, never fails checkout."""
+    user = await db.users.find_one({"_id": user_id}, {"location": 1})
+    lon, lat = user["location"]["coordinates"]
+    trip = await mcp_tool("plan_trip", {"lon": lon, "lat": lat, "stores": stores})
+    if "error" not in trip:  # saved before the audit event, which makes the UI refetch the plan
+        await db.plans.update_one({"_id": pid}, {"$set": {"trip": trip}})
+    await audit(pid, "system", "plan_trip", result={k: v for k, v in trip.items() if k != "geometry"})
 
 
 async def stock_pantry(user_id, receipts, sign):
@@ -221,7 +232,7 @@ async def cancel(pid: str, uid: Uid):
         async with connect() as mcp:
             await undo(receipts, [r["payment_id"] for r in receipts], stores.call, Wallet(mcp), logger(pid, "cancel"))
         await stock_pantry(plan["user_id"], receipts, -1)
-    await transition(pid, plan["state"], "cancelled")
+    await transition(pid, plan["state"], "cancelled", trip=None)  # nothing to pick up any more
     return {"ok": True}
 
 

@@ -151,7 +151,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
         </div>
         <div className="col right">
           <Receipt plan={plan} onApprove={() => approve()} onCancel={cancel} />
-          <MapView branches={plan?.branches} />
+          <MapView branches={plan?.branches} trip={plan?.trip} />
           <div className="home">
             <Pantry items={pantry} onTick={tick} />
             <Stats stats={stats} />

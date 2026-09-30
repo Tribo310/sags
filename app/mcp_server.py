@@ -227,6 +227,28 @@ async def get_route(from_lon: float, from_lat: float, to_lon: float, to_lat: flo
 
 
 @mcp.tool()
+async def plan_trip(lon: float, lat: float, stores: list[str]) -> dict:
+    """One round trip from home to each store's nearest branch, stops in the fastest order (OSRM trip)."""
+    branches = (await nearest_branches(lon, lat, stores))["branches"]
+    if not branches:
+        return {"error": "no branches found"}
+    points = [[lon, lat], *(br["location"]["coordinates"] for br in branches)]
+    try:
+        async with httpx.AsyncClient(timeout=10) as h:
+            r = (await h.get(f"{OSRM}/trip/v1/driving/{';'.join(f'{x},{y}' for x, y in points)}", params={
+                "roundtrip": "true", "source": "first", "geometries": "geojson", "overview": "simplified"})).json()
+        trip = r["trips"][0]
+    except Exception as e:
+        return {"error": f"route unavailable: {e}"}
+    order = sorted(range(len(branches)), key=lambda i: r["waypoints"][i + 1]["waypoint_index"])
+    legs = trip["legs"]  # legs[k] ends at the k-th stop; the last one drives home
+    return {"home": [lon, lat], "km": round(trip["distance"] / 1000, 1), "minutes": round(trip["duration"] / 60),
+            "stops": [{**branches[i], "km": round(legs[k]["distance"] / 1000, 1), "minutes": round(legs[k]["duration"] / 60)}
+                      for k, i in enumerate(order)],
+            "geometry": trip["geometry"]["coordinates"]}
+
+
+@mcp.tool()
 async def wallet_hold(plan_id: str, store: str, amount: int) -> dict:
     """Hold money for one store order. Policy is enforced here: only an approved plan that is checking out, within budget."""
     plan = await db.plans.find_one({"_id": plan_id})

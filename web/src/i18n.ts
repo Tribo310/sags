@@ -67,9 +67,11 @@ export function describe(ev: AuditEvent): [string, string] {
     case "make_offer": return ["Санал тавилаа", r.message
       || (n(r.discounts) ? `${n(r.discounts)} бараанд хямдрал` : "хямдрал өгөхгүй")];
     case "reservation_expired": return [`${storeName(ev.actor)}: захиалгын хугацаа дууслаа`, fmt(r.total)];
-    case "show_on_map": return ["Газрын зураг дээр харууллаа", r.on_map
-      ? r.on_map.map((b: { branch: string; km?: number }) => `${b.branch}${b.km != null ? ` (${b.km} км)` : ""}`).join(", ")
-      : r.error];
+    case "show_on_map": case "plan_trip": {
+      const stops: { branch?: string; name?: string }[] | undefined = r.stops_in_order ?? r.stops;
+      return ["Замын маршрут гаргалаа", stops
+        ? `${stops.map((s) => s.branch ?? s.name).join(" → ")} → гэр, ${r.km} км, ${r.minutes} мин` : r.error];
+    }
     case "nearest_branches": return ["Ойрын салбар хайлаа", ""];
     case "get_route": return ["Зам тооцлоо", r.km ? `${r.km} км, ${r.minutes} мин` : ""];
     case "remember": return ["Санаж авлаа", a.fact];
