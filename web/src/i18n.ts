@@ -36,6 +36,7 @@ export function describe(ev: AuditEvent): [string, string] {
   switch (ev.action) {
     case "message": return ["Хүсэлт ирлээ", a.text];
     case "reply": return ["Хариу бичлээ", ""];
+    case "ask": return ["Сонголт асуулаа", r.options?.join(" / ") ?? r.error];
     case "state": return ["Төлөв", `${stateName(r.from)} → ${stateName(r.to)}`];
     case "get_profile": return ["Гэр бүлийн мэдээлэл уншлаа", r.household ? `${r.household} хүн, санасан зүйл ${n(r.memory)}` : r.error];
     case "search_recipes": return ["Жор хайлаа", r.recipes ? `${n(r.recipes)} жор олдлоо` : r.error];

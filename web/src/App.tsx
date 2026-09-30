@@ -50,6 +50,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     const r = ev.result ?? {};
     if (ev.actor === "user" && ev.action === "message") say({ who: "user", text: ev.args?.text });
     if (ev.action === "reply" && r.text) say({ who: "agent", text: r.text });
+    if (ev.action === "ask" && r.text) say({ who: "agent", text: r.text, actions: r.options?.map((o: string) => ({ label: o, send: o })) });
     if (ev.action === "reroute")
       say({ who: "agent", text: `${r.name} ${storeName(r.from_store)}-д дууссан тул ${storeName(r.to_store)}-оос ${fmt(r.price)}-өөр авна.` });
     if (ev.action === "replan") warn(`${r.sold_out} бүх дэлгүүрт дууссан. Төлөвлөгөөг шинэчилж байна.`);
@@ -65,7 +66,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     offered.current.add(a.key);
     say({
       who: "agent", text: `${a.name} ${a.days_left} хоногийн дараа дуусна, ${a.amount} ${a.unit} үлдсэн.`,
-      action: { label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` },
+      actions: [{ label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` }],
     });
   };
 
@@ -74,7 +75,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     say({
       who: "agent",
       text: `${a.name} ${storeName(a.store)}-д ${a.pct}% хямдарлаа: ${fmt(a.old)} → ${fmt(a.new)}.${a.lowest_30d ? " Сүүлийн 30 хоногийн хамгийн бага үнэ." : ""}`,
-      action: { label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` },
+      actions: [{ label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` }],
     });
   };
 
