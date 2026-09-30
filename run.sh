@@ -20,11 +20,17 @@ wait_up() {
   echo "$2 did not start on :$1"
   exit 1
 }
-up 27018 || {
-  echo "starting mongo"
-  docker compose up -d
-  wait_up 27018 mongo
-}
+# Local Mongo only when MONGO_URL points here (empty = db.py's localhost default); Atlas needs nothing started.
+MONGO_URL=$(grep -m1 '^MONGO_URL=' .env | cut -d= -f2-) || true
+case "${MONGO_URL:-localhost}" in
+*localhost* | *127.0.0.1*)
+  up 27018 || {
+    echo "starting mongo"
+    docker compose up -d
+    wait_up 27018 mongo
+  }
+  ;;
+esac
 up 11434 || {
   echo "starting ollama"
   ollama serve >/dev/null 2>&1 &
