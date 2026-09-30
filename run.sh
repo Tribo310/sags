@@ -38,7 +38,10 @@ up 11434 || {
 }
 
 if [ "${DEMO:-}" = 1 ]; then $R python -m seed.seed; fi
-[ -f web/dist/index.html ] || (cd web && npm install && npm run build)
+# rebuild when missing or older than any frontend source (a pull otherwise serves a stale bundle)
+if [ ! -f web/dist/index.html ] || [ -n "$(find web/src web/index.html web/package.json -newer web/dist/index.html -print -quit)" ]; then
+  (cd web && npm install && npm run build)
+fi
 
 $R python -m app.mcp_server &
 for s in nomin:9101 emart:9102 sansar:9103; do
