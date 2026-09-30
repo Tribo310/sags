@@ -6,6 +6,7 @@ export interface AuditEvent {
   plan_id: string;
   actor: string;
   action: string;
+  model?: string | null;
   args?: Record<string, any> | null;
   result?: Record<string, any> | null;
   reason?: string | null;

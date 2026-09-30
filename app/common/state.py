@@ -33,3 +33,10 @@ async def transition(plan_id, frm, to, match=None, **fields):
         raise StateConflict(f"plan {plan_id} is no longer {frm} (changed concurrently)")
     await audit(plan_id, "system", "state", result={"from": frm, "to": to})
     return doc
+
+
+async def reopen(plan):
+    """The plan changes (the agent replans, or a sold-out checkout): new version, the old approval is void."""
+    return await transition(plan["_id"], plan["state"], "planning", match={"version": plan["version"]},
+                            version=plan["version"] + 1, basket=None, quotes=None, needed=None, offers=None,
+                            negotiated=None, summary=None, branches=None, error=None)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts MCP server, 3 store agents and the planner. Ctrl-C stops all.
-# DEMO=1 ./run.sh  reseeds the DB and swaps the LLM for a deterministic script (app/planner/script.py).
+# DEMO=1 ./run.sh  reseeds the DB and swaps the LLM for a deterministic script (app/agents/demo.py).
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -f .env ] || { echo "missing .env: cp .env.example .env and fill it in"; exit 1; }
@@ -18,7 +18,7 @@ if [ "${DEMO:-}" = 1 ]; then $R python -m seed.seed; fi
 
 $R python -m app.mcp_server &
 for s in nomin:9101 emart:9102 sansar:9103; do
-  STORE=${s%:*} PORT=${s#*:} $R python -m app.store_agent &
+  STORE=${s%:*} PORT=${s#*:} $R python -m app.agents.store.server &
 done
 
 # Planner discovers store agents at startup: wait until their cards (and MCP) answer.

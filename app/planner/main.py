@@ -13,12 +13,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.common.db import agg, audit, db, now
-from app.common.state import StateConflict, transition
-from app.planner import stores
-from app.planner.agent import run_agent
+from app.common.state import StateConflict, reopen, transition
+from app.agents.manager import run_manager
+from app.agents.protocols import a2a as stores
+from app.agents.protocols.mcp import call_json, connect
 from app.planner.auth import current_user, router as auth_router
-from app.planner.checkout import SoldOut, checkout, undo
-from app.planner.mcp_client import Wallet, call_json, connect
+from app.planner.checkout import SoldOut, Wallet, checkout, undo
 
 REFILL_DAYS = 2  # suggest a refill when a pantry item lasts this many days or less
 PRICE_DROP = 0.10  # alert when a price falls by at least this fraction
@@ -69,16 +69,12 @@ def sse(e):
     return f"data: {json.dumps({k: v for k, v in e.items() if k != '_id'}, default=str, ensure_ascii=False)}\n\n"
 
 
-async def reopen(plan):
-    """The plan changes (user message or sold-out checkout): new version, the old approval is void."""
-    await transition(plan["_id"], plan["state"], "planning", version=plan["version"] + 1,
-                     basket=None, quotes=None, summary=None, branches=None, error=None)
-
-
 async def claim(pid):
-    """One agent loop per plan: a second message while it works would fork the conversation."""
-    return await db.plans.find_one_and_update({"_id": pid, "state": "planning", "running": {"$ne": True}},
-                                              {"$set": {"running": True}})
+    """One agent loop per plan: a second message while it works would fork the conversation. A plan awaiting
+    approval stays proposed while the agent answers; it's reopened only if the agent changes it (manager.replan)."""
+    return await db.plans.find_one_and_update(
+        {"_id": pid, "state": {"$in": ["planning", "awaiting_approval"]}, "running": {"$ne": True}},
+        {"$set": {"running": True}})
 
 
 async def own_plan(pid, uid, projection=None):
@@ -94,7 +90,7 @@ async def chat(body: ChatIn, bg: BackgroundTasks, uid: Uid):
     if body.plan_id:
         plan = await own_plan(body.plan_id, uid)
         pid = plan["_id"]
-        if plan["state"] in ("awaiting_approval", "failed"):
+        if plan["state"] == "failed":
             await reopen(plan)
         if not await claim(pid):
             raise HTTPException(409, "the agent is still working on this plan, or it can't be changed any more")
@@ -109,7 +105,7 @@ async def chat(body: ChatIn, bg: BackgroundTasks, uid: Uid):
 
 async def agent_task(pid, text):
     try:
-        await run_agent(pid, text)
+        await run_manager(pid, text)
     except Exception as e:
         await audit(pid, "agent", "error", result={"error": f"{type(e).__name__}: {e}"})
         if (await db.plans.find_one({"_id": pid}))["state"] == "planning":
@@ -144,6 +140,8 @@ async def approve(pid: str, body: ApproveIn, bg: BackgroundTasks, uid: Uid):
     plan = await own_plan(pid, uid)
     if plan["state"] != "awaiting_approval" or plan["version"] != body.version:
         raise HTTPException(409, "plan changed or is not awaiting approval")
+    if plan.get("running"):  # the agent may be about to change it
+        raise HTTPException(409, "the assistant is still answering; approve once it's done")
     user = await db.users.find_one({"_id": plan["user_id"]})
     total = plan["basket"]["total"]
     if total > user["policy"]["approval_threshold"] and not body.confirm_high:
@@ -220,6 +218,23 @@ async def cancel(pid: str, uid: Uid):
 async def mcp_tool(name, args):
     async with connect() as mcp:
         return await call_json(mcp, name, args)
+
+
+@app.get("/metrics/agents")
+async def agent_metrics(_: Uid, hours: int = 24):
+    """Per-agent health from the ReAct traces in audit_log: steps, tool errors, stalls, latency, tokens, models."""
+    return await agg(db.audit_log, [
+        {"$match": {"meta": {"$ne": None}, "ts": {"$gte": now() - timedelta(hours=hours)}}},
+        {"$group": {"_id": "$actor", "steps": {"$sum": 1},
+                    "tool_errors": {"$sum": {"$cond": [{"$ifNull": ["$result.error", False]}, 1, 0]}},
+                    "stalls": {"$sum": {"$ifNull": ["$meta.stalls", 0]}},
+                    "llm_ms": {"$percentile": {"input": "$meta.llm_ms", "p": [0.5, 0.95], "method": "approximate"}},
+                    "tool_ms": {"$percentile": {"input": "$meta.tool_ms", "p": [0.5, 0.95], "method": "approximate"}},
+                    "tokens": {"$sum": {"$add": [{"$ifNull": ["$meta.prompt_tokens", 0]},
+                                                 {"$ifNull": ["$meta.completion_tokens", 0]}]}},
+                    "models": {"$addToSet": "$model"}}},
+        {"$set": {"agent": "$_id", "error_rate": {"$round": [{"$divide": ["$tool_errors", "$steps"]}, 3]}}},
+        {"$project": {"_id": 0}}, {"$sort": {"steps": -1}}])
 
 
 @app.get("/me/stats")

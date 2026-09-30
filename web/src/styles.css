@@ -54,6 +54,12 @@ main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.
 .timeline li.agent::before { background: var(--blue); }
 .timeline li.wallet::before { background: var(--ok); }
 .timeline li.checkout::before, .timeline li.cancel::before, .timeline li.recovery::before { background: var(--amber); }
+.timeline li.manager::before { background: var(--blue); }
+.timeline li.meal_planner::before, .timeline li.procurement::before, .timeline li.advisor::before { background: var(--ok); }
+.timeline li.nomin::before, .timeline li.emart::before, .timeline li.sansar::before { background: var(--ink); }
+.timeline li.meal_planner, .timeline li.procurement, .timeline li.advisor { padding-left: 20px; }
+.timeline li.nomin, .timeline li.emart, .timeline li.sansar { padding-left: 34px; }
+.timeline .who { display: block; font-size: 12px; color: var(--mute); }
 .timeline li.bad::before { background: var(--red); }
 .timeline li.end { margin: 0; }
 .timeline li.end::before { display: none; }
