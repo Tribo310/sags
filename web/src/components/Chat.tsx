@@ -47,12 +47,12 @@ export default function Chat({ items, onSend, onError }: Props) {
             transition={{ type: "spring", stiffness: 400, damping: 30 }}
             style={{ transformOrigin: m.who === "user" ? "bottom right" : "bottom left" }}>
             {m.text}
-            {m.action && !used.has(m.id) && (
-              <motion.button type="button" className="inline" whileTap={{ scale: 0.97 }} onClick={() => {
+            {!used.has(m.id) && m.actions?.map((a) => (
+              <motion.button type="button" key={a.label} className="inline" whileTap={{ scale: 0.97 }} onClick={() => {
                 setUsed((s) => new Set(s).add(m.id));
-                onSend(m.action!.send);
-              }}>{m.action.label}</motion.button>
-            )}
+                onSend(a.send);
+              }}>{a.label}</motion.button>
+            ))}
           </motion.div>
         ))}
         <div ref={end} />

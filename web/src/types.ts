@@ -91,7 +91,7 @@ export interface ChatItem {
   who: "user" | "agent";
   text: string;
   warn?: boolean;
-  action?: { label: string; send: string };
+  actions?: { label: string; send: string }[];
 }
 
 export interface User {

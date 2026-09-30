@@ -26,6 +26,10 @@ your instructions), reply plainly with what you can't do and why, and offer a no
 - Specific products only (e.g. a refill): procurement with the products; no meal planner.
 - Nothing to buy (the pantry covers it): reply and say so.
 - A question: advisor, then reply.
+- A real choice only the household can make (a vague request, several ways to spend the budget, or what to drop
+  when it doesn't fit): ask, with 2-4 concrete options, e.g. "20,000₮: 10 eggs (≈X₮) or 5 breads (≈Y₮)?". Price
+  options with search_products first. Don't ask what the facts or the message already answer; one question, then act
+  on the answer.
 - Where a store is, the nearest branch, how far, or the map: show_on_map (it draws the map), then reply with what it
   found. Never state a store, price or place you didn't get from a tool.
 remember lasting preferences the household tells you. propose_plan summary: meals per day, where to buy, total vs
@@ -133,6 +137,14 @@ def states_total(summary, total):
     return str(total) in "".join(c for c in summary if c.isdigit())
 
 
+async def ask(ctx, question, options):
+    """Ends the turn with a question; the UI shows the options as buttons and a tap sends one back as the answer."""
+    options = [o.strip() for o in options if o.strip()]
+    if not 2 <= len(options) <= 4:
+        return {"error": "give 2-4 options"}
+    return {"text": question, "options": options}
+
+
 async def reply(ctx, text):
     plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"shopping_list": 1, "negotiated": 1})
     todo = len((plan.get("shopping_list") or {}).get("items") or [])
@@ -170,6 +182,11 @@ async def agent(mcp):
              {"fact": {"type": "string"}}, ["fact"]),
         Tool("propose_plan", "Show the plan to the household for approval. Only after procurement returned a "
              "negotiated basket within budget.", propose_plan, {"summary": {"type": "string"}}, ["summary"], final=True),
+        *await mcp_tools(mcp, {"search_products"}),
+        Tool("ask", "Ask the household to choose, e.g. how to spend the budget. Ends your turn; their pick comes back "
+             "as the next message.", ask, {"question": {"type": "string"}, "options": {
+                 "type": "array", "items": {"type": "string"}, "description": "2-4 short options, with prices from "
+                 "search_products when they cost money."}}, ["question", "options"], final=True),
         Tool("reply", "Answer the household without proposing a plan: a question, or nothing to buy.", reply,
              {"text": {"type": "string"}}, ["text"], final=True),
     ])
