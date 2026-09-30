@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import uuid
@@ -132,20 +133,16 @@ async def get_plan(pid: str, uid: Uid):
     return await own_plan(pid, uid, {"messages": 0, "quotes": 0})
 
 
-@app.get("/plans/{pid}/events")
-async def events(pid: str, uid: Uid):
+async def plan_events(pid):
     """Replays the plan's audit log, then streams new entries live from a MongoDB change stream."""
-    await own_plan(pid, uid, {"_id": 1})
-    async def gen():
-        seen = set()
-        async with await db.audit_log.watch([{"$match": {"operationType": "insert", "fullDocument.plan_id": pid}}]) as stream:
-            async for e in db.audit_log.find({"plan_id": pid}).sort("ts", 1):
-                seen.add(e["_id"])
-                yield sse(e)
-            async for ch in stream:
-                if ch["fullDocument"]["_id"] not in seen:
-                    yield sse(ch["fullDocument"])
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    seen = set()
+    async with await db.audit_log.watch([{"$match": {"operationType": "insert", "fullDocument.plan_id": pid}}]) as stream:
+        async for e in db.audit_log.find({"plan_id": pid}).sort("ts", 1):
+            seen.add(e["_id"])
+            yield e
+        async for ch in stream:
+            if ch["fullDocument"]["_id"] not in seen:
+                yield ch["fullDocument"]
 
 
 @app.post("/plans/{pid}/approve")
@@ -268,41 +265,65 @@ async def tick(uid: Uid):
     return {"updated": r.modified_count}
 
 
-@app.get("/me/alerts")
-async def alerts(uid: Uid):
-    """Change stream on the pantry: pushes a refill suggestion once an item lasts REFILL_DAYS or less."""
-    async def gen():
-        async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}, "fullDocument.user_id": uid}}],
-                                         full_document="updateLookup") as stream:
-            async for ch in stream:
-                d = ch.get("fullDocument")
-                if not d or d["user_id"] != uid or d.get("daily_use", 0) <= 0:
-                    continue
-                days = round(d["amount"] / d["daily_use"], 1)  # rounded like get_pantry, so 0.7999/0.4 counts as 2 days
-                if days <= REFILL_DAYS:
-                    yield sse({"key": d["key"], "name": d["name"], "unit": d["unit"], "amount": round(d["amount"], 2),
-                               "days_left": days})
-    return StreamingResponse(gen(), media_type="text/event-stream")
+async def pantry_alerts(uid):
+    """Change stream on the pantry: a refill suggestion once an item lasts REFILL_DAYS or less."""
+    async with await db.pantry.watch([{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}, "fullDocument.user_id": uid}}],
+                                     full_document="updateLookup") as stream:
+        async for ch in stream:
+            d = ch.get("fullDocument")
+            if not d or d["user_id"] != uid or d.get("daily_use", 0) <= 0:
+                continue
+            days = round(d["amount"] / d["daily_use"], 1)  # rounded like get_pantry, so 0.7999/0.4 counts as 2 days
+            if days <= REFILL_DAYS:
+                yield {"key": d["key"], "name": d["name"], "unit": d["unit"], "amount": round(d["amount"], 2),
+                       "days_left": days}
 
 
-@app.get("/price-alerts")
-async def price_alerts():
-    """Change stream on product prices; the pre-image gives the old price. Pushes drops of PRICE_DROP or more."""
-    async def gen():
-        async with await db.products.watch(
-                [{"$match": {"operationType": "update", "updateDescription.updatedFields.price": {"$exists": True}}}],
-                full_document_before_change="whenAvailable") as stream:
-            async for ch in stream:
-                old, new = ch.get("fullDocumentBeforeChange"), ch["updateDescription"]["updatedFields"]["price"]
-                if not old or new > old["price"] * (1 - PRICE_DROP):
-                    continue
-                lows = await agg(db.price_history, [{"$match": {"meta.key": old["key"], "meta.store": old["store"],
-                                                                 "ts": {"$gte": now() - timedelta(days=30)}}},
-                                                     {"$group": {"_id": None, "min": {"$min": "$price"}}}])
-                yield sse({"store": old["store"], "key": old["key"], "name": old["name_mn"], "old": old["price"], "new": new,
-                           "pct": round(100 * (1 - new / old["price"])),
-                           "lowest_30d": bool(lows) and new <= lows[0]["min"]})
-    return StreamingResponse(gen(), media_type="text/event-stream")
+async def price_drops():
+    """Change stream on product prices; the pre-image gives the old price. Drops of PRICE_DROP or more."""
+    async with await db.products.watch(
+            [{"$match": {"operationType": "update", "updateDescription.updatedFields.price": {"$exists": True}}}],
+            full_document_before_change="whenAvailable") as stream:
+        async for ch in stream:
+            old, new = ch.get("fullDocumentBeforeChange"), ch["updateDescription"]["updatedFields"]["price"]
+            if not old or new > old["price"] * (1 - PRICE_DROP):
+                continue
+            lows = await agg(db.price_history, [{"$match": {"meta.key": old["key"], "meta.store": old["store"],
+                                                             "ts": {"$gte": now() - timedelta(days=30)}}},
+                                                 {"$group": {"_id": None, "min": {"$min": "$price"}}}])
+            yield {"store": old["store"], "key": old["key"], "name": old["name_mn"], "old": old["price"], "new": new,
+                   "pct": round(100 * (1 - new / old["price"])), "lowest_30d": bool(lows) and new <= lows[0]["min"]}
+
+
+async def merged(sources):
+    """Several live sources over one SSE connection, each message tagged with its source. Browsers allow 6 HTTP/1.1
+    connections per host: three streams per tab hung the page after a refresh or a second tab."""
+    q = asyncio.Queue()
+
+    async def pump(name, gen):
+        try:
+            async for item in gen:
+                await q.put(sse({**item, "stream": name}))
+        except Exception as e:  # one broken change stream must not take the others down
+            print(f"stream {name} stopped: {e!r}")
+
+    tasks = [asyncio.create_task(pump(name, gen)) for name, gen in sources.items()]
+    try:
+        while True:
+            yield await q.get()
+    finally:
+        for t in tasks:
+            t.cancel()
+
+
+@app.get("/me/stream")
+async def live(uid: Uid, plan_id: str | None = None):
+    """The one live connection a tab needs: the open plan's steps, pantry refill alerts and price drops."""
+    sources = {"alert": pantry_alerts(uid), "price": price_drops()}
+    if plan_id:
+        await own_plan(plan_id, uid, {"_id": 1})
+        sources["event"] = plan_events(plan_id)
+    return StreamingResponse(merged(sources), media_type="text/event-stream")
 
 
 @app.post("/stt")

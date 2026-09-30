@@ -29,10 +29,11 @@ export function useEventSource<T>(url: string | null, onMessage: (data: T) => vo
 }
 
 /**
- * Follows one plan: the audit log (replayed by the server on every (re)connect, then live from a change stream)
- * plus the plan document, reloaded shortly after each burst of events.
+ * Follows one plan: its audit events (replayed by the server on every (re)connect of the tab's live stream, then
+ * live from a change stream) plus the plan document, reloaded shortly after each burst of events.
+ * The caller feeds it: push(ev) for each event, reset() when the stream (re)opens.
  */
-export function usePlan(planId: string | null, onEvent: (ev: AuditEvent) => void, onReset: () => void) {
+export function usePlan(planId: string | null) {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [plan, setPlan] = useState<Plan | null>(null);
   const timer = useRef<number>(undefined);
@@ -43,18 +44,11 @@ export function usePlan(planId: string | null, onEvent: (ev: AuditEvent) => void
     return () => clearTimeout(timer.current);
   }, [planId]);
 
-  useEventSource<AuditEvent>(
-    planId && `/plans/${planId}/events`,
-    (ev) => {
-      setEvents((xs) => [...xs, ev]);
-      onEvent(ev);
-      clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => api.plan(planId!).then(setPlan).catch(() => {}), 300);
-    },
-    () => {
-      setEvents([]);
-      onReset();
-    },
-  );
-  return { plan, events };
+  const push = (ev: AuditEvent) => {
+    setEvents((xs) => [...xs, ev]);
+    clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => api.plan(planId!).then(setPlan).catch(() => {}), 300);
+  };
+  const reset = () => setEvents([]);
+  return { plan, events, push, reset };
 }
