@@ -101,6 +101,7 @@ export interface ChatItem {
   text: string;
   warn?: boolean;
   actions?: { label: string; send: string }[];
+  choice?: boolean;  // the manager's ask: one of actions must be picked
 }
 
 export interface User {
