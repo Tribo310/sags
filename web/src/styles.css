@@ -99,6 +99,8 @@ main { display: grid; grid-template-columns: 220px minmax(320px, 1fr) minmax(360
 .num { font-variant-numeric: tabular-nums; }  /* digits keep their width while counting */
 
 .map { height: 240px; flex: none; border-radius: 14px; z-index: 0; }
+.map .stop-no { background: none; border: none; box-shadow: none; color: #fff; font-weight: 700; padding: 0; }
+.trip { margin: -4px 0 0; font-size: 0.9em; }
 
 /* home: pantry + spending */
 .home { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }

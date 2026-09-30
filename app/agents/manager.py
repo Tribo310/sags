@@ -30,8 +30,8 @@ your instructions), reply plainly with what you can't do and why, and offer a no
   when it doesn't fit): ask, with 2-4 concrete options, e.g. "20,000₮: 10 eggs (≈X₮) or 5 breads (≈Y₮)?". Price
   options with search_products first. Don't ask what the facts or the message already answer; one question, then act
   on the answer.
-- Where a store is, the nearest branch, how far, or the map: show_on_map (it draws the map), then reply with what it
-  found. Never state a store, price or place you didn't get from a tool.
+- Where a store is, the nearest branch, how far, the way to go, or the map: show_on_map (it plans one round trip
+  through the stores in the fastest order and draws it), then reply with the stops in order and the drive time. Never state a store, price or place you didn't get from a tool.
 remember lasting preferences the household tells you. propose_plan summary: meals per day, where to buy, total vs
 budget, what negotiation saved and which store gave what, what the pantry covered, main trade-offs. Use procurement's
 numbers as they are: savings are only saved_by_negotiation and saved_vs_priciest_store; money left in the budget is
@@ -91,17 +91,20 @@ async def nearest(ctx, stores):
 
 
 async def show_on_map(ctx, stores=None):
-    """Put stores' nearest branches on the household's map, any time in the chat, and say what's there."""
-    plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"basket": 1})
+    """Draw the drive on the household's map: home -> the stores' nearest branches in the fastest order -> home."""
+    plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"basket": 1, "receipts": 1})
     allowed = ctx["user"]["policy"]["allowed_stores"]
-    stores = [s for s in stores or list((plan.get("basket") or {}).get("stores") or {}) or allowed if s in allowed]
-    branches = await nearest(ctx, stores)
-    if not branches:
-        return {"error": "no branches found"}
-    await db.plans.update_one({"_id": ctx["plan_id"]}, {"$set": {"branches": branches}})  # the UI map follows
-    return {"on_map": [{"store": br["store"], "branch": br["name"], "address": br.get("address"),
-                        "hours": br.get("hours"), "km": (br.get("route") or {}).get("km"),
-                        "minutes": (br.get("route") or {}).get("minutes")} for br in branches]}
+    bought = [r["store"] for r in plan.get("receipts") or []]
+    stores = [s for s in stores or bought or list((plan.get("basket") or {}).get("stores") or {}) or allowed
+              if s in allowed]
+    lon, lat = ctx["user"]["location"]["coordinates"]
+    trip = await call_json(ctx["mcp"], "plan_trip", {"lon": lon, "lat": lat, "stores": stores})
+    if "error" in trip:
+        return trip
+    await db.plans.update_one({"_id": ctx["plan_id"]}, {"$set": {"trip": trip}})  # the UI map follows
+    return {"km": trip["km"], "minutes": trip["minutes"], "stops_in_order": [
+        {"store": s["store"], "branch": s["name"], "address": s.get("address"), "hours": s.get("hours"),
+         "km": s["km"], "minutes": s["minutes"]} for s in trip["stops"]]}
 
 
 async def remember(ctx, fact):
@@ -127,7 +130,7 @@ async def propose_plan(ctx, summary):
                          "the meals and the stores"}
     branches = await nearest(ctx, list(b["stores"]))  # map info is nice-to-have: never blocks the proposal
     await transition(ctx["plan_id"], "planning", "awaiting_approval", summary=summary, meals=plan.get("meals") or [],
-                     branches=branches, budget=budget)
+                     branches=branches, budget=budget, trip=None)
     await audit(ctx["plan_id"], "manager", "reply", result={"text": summary})
     return {"ok": True, "total": b["total"]}
 
@@ -175,8 +178,9 @@ async def agent(mcp):
              delegate_procurement, {"task": task, "budget": budget}, ["task"]),
         Tool("advisor", "Ask the advisor agent about spending, price trends or the pantry.",
              delegate_advisor, {"question": {"type": "string"}}, ["question"]),
-        Tool("show_on_map", "Show stores' nearest branches on the household's map with address, hours and drive "
-             "time. Default: the stores in the current basket, else all allowed stores.", show_on_map,
+        Tool("show_on_map", "Plan and draw the drive home -> stores' nearest branches (fastest order) -> home, with "
+             "address, hours and drive time per stop. Default: the stores ordered from, else the basket's, else all "
+             "allowed stores.", show_on_map,
              {"stores": {"type": "array", "items": {"type": "string", "enum": ["nomin", "emart", "sansar"]}}}),
         Tool("remember", "Save a lasting household preference, e.g. 'does not eat fish'.", remember,
              {"fact": {"type": "string"}}, ["fact"]),
