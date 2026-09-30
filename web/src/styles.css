@@ -25,7 +25,12 @@ td.n { text-align: right; white-space: nowrap; padding-left: 12px; }
 .state[data-s=failed] { color: var(--red); border-color: var(--red); }
 .state[data-s=completed] { color: var(--ok); border-color: var(--ok); }
 
-main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.2fr); gap: 20px; padding: 12px 24px 24px; height: calc(100vh - 64px); }
+main { display: grid; grid-template-columns: 220px minmax(320px, 1fr) minmax(360px, 1.2fr); gap: 20px; padding: 12px 24px 24px; height: calc(100vh - 64px); }
+.history { background: var(--paper); border-radius: 14px; padding: 12px; overflow: auto; display: flex; flex-direction: column; gap: 4px; font-size: 14px; min-height: 0; }
+.history button.row { text-align: left; background: transparent; color: var(--ink); font-weight: 400; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.history button.row:hover, .history button.row[aria-current=true] { background: var(--blue-soft); }
+.history .row b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.history .row span { color: var(--mute); font-size: 12px; }
 .col { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
 .right { overflow: auto; padding-right: 4px; }
 
@@ -129,4 +134,5 @@ button:disabled { opacity: .6; cursor: default; }
   .talk { min-height: 60vh; }
   .right { overflow: visible; }
   .home { grid-template-columns: 1fr; }
+  .history { max-height: 30vh; }
 }

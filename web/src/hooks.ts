@@ -39,6 +39,7 @@ export function usePlan(planId: string | null, onEvent: (ev: AuditEvent) => void
 
   useEffect(() => {
     setPlan(null);
+    setEvents([]);
     return () => clearTimeout(timer.current);
   }, [planId]);
 

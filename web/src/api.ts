@@ -1,4 +1,4 @@
-import type { PantryItem, Plan, RegisterIn, Stats, User } from "./types";
+import type { PantryItem, Plan, PlanRow, ProfileIn, RegisterIn, Stats, User } from "./types";
 
 const NO_RETRY = ["/auth/login", "/auth/register", "/auth/refresh", "/auth/logout"];
 
@@ -41,6 +41,8 @@ export const api = {
   login: (email: string, password: string) => call<{ ok: boolean }>("/auth/login", { json: { email, password } }),
   register: (body: RegisterIn) => call<{ ok: boolean }>("/auth/register", { json: body }),
   logout: () => call<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+  updateMe: (body: ProfileIn) => call<User>("/auth/me", { method: "PATCH", json: body }),
+  plans: () => call<PlanRow[]>("/plans"),
   chat: (text: string, plan_id: string | null) => call<{ plan_id: string }>("/chat", { json: { text, plan_id } }),
   plan: (id: string) => call<Plan>(`/plans/${id}`),
   approve: (id: string, version: number, confirm_high = false) =>
