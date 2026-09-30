@@ -1,21 +1,29 @@
-import { AnimatePresence, motion, MotionConfig } from "motion/react";
+import { MotionConfig } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
 import Auth from "./components/Auth";
 import Chat from "./components/Chat";
 import History from "./components/History";
+import { Basket, Chat as ChatIcon, Home as HomeIcon, Route } from "./components/Icons";
 import MapView from "./components/MapView";
 import Pantry from "./components/Pantry";
 import Receipt from "./components/Receipt";
+import RunStepper, { phaseOf } from "./components/RunStepper";
 import Settings from "./components/Settings";
 import Stats from "./components/Stats";
 import Timeline from "./components/Timeline";
-import { fmt, stateName, storeName } from "./i18n";
+import { fmt, storeName } from "./i18n";
 import { useEventSource, usePlan } from "./hooks";
 import type { AuditEvent, ChatItem, PantryItem, PlanRow, PriceAlert, RefillAlert, Stats as StatsData, User } from "./types";
 
 const EDITABLE = ["planning", "awaiting_approval", "failed"];
+const SETTLED = ["awaiting_approval", "completed", "failed", "cancelled"];
+type Tab = "chat" | "basket" | "route" | "pantry";
+const WORK_TABS: [Tab, string][] = [["basket", "Сагс"], ["route", "Зам"], ["pantry", "Гэрт байгаа"]];
+const PHONE_TABS: [Tab, string, React.ComponentType][] = [
+  ["chat", "Чат", ChatIcon], ["basket", "Сагс", Basket], ["route", "Зам", Route], ["pantry", "Гэр", HomeIcon],
+];
 
 function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => void; onLogout: () => void }) {
   // The open conversation survives a reload; keyed per account so a shared browser doesn't mix them up.
@@ -28,6 +36,8 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
   }, [planId, saved]);
   const [plans, setPlans] = useState<PlanRow[]>([]);
   const [view, setView] = useState<"chat" | "settings">("chat");
+  const [tab, setTab] = useState<Tab>("chat");  // phone: the one visible pane; desktop: chat means the basket tab
+  const [drawer, setDrawer] = useState(false);  // history drawer below 1280px
   const [chat, setChat] = useState<ChatItem[]>([]);
   const [pantry, setPantry] = useState<PantryItem[]>([]);
   const [stats, setStats] = useState<StatsData | null>(null);
@@ -50,6 +60,8 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     const r = ev.result ?? {};
     if (ev.actor === "user" && ev.action === "message") say({ who: "user", text: ev.args?.text });
     if (ev.action === "reply" && r.text) say({ who: "agent", text: r.text });
+    if (ev.action === "ask" && r.text)
+      say({ who: "agent", text: r.text, choice: !!r.options?.length, actions: r.options?.map((o: string) => ({ label: o, send: o })) });
     if (ev.action === "reroute")
       say({ who: "agent", text: `${r.name} ${storeName(r.from_store)}-д дууссан тул ${storeName(r.to_store)}-оос ${fmt(r.price)}-өөр авна.` });
     if (ev.action === "replan") warn(`${r.sold_out} бүх дэлгүүрт дууссан. Төлөвлөгөөг шинэчилж байна.`);
@@ -65,7 +77,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     offered.current.add(a.key);
     say({
       who: "agent", text: `${a.name} ${a.days_left} хоногийн дараа дуусна, ${a.amount} ${a.unit} үлдсэн.`,
-      action: { label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` },
+      actions: [{ label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` }],
     });
   };
 
@@ -74,7 +86,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     say({
       who: "agent",
       text: `${a.name} ${storeName(a.store)}-д ${a.pct}% хямдарлаа: ${fmt(a.old)} → ${fmt(a.new)}.${a.lowest_30d ? " Сүүлийн 30 хоногийн хамгийн бага үнэ." : ""}`,
-      action: { label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` },
+      actions: [{ label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` }],
     });
   };
 
@@ -113,6 +125,7 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
 
   const pick = (id: string | null) => {
     setView("chat");
+    setDrawer(false);
     if (id === planId) return;
     setChat([]);
     setPlanId(id);
@@ -121,43 +134,83 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
   const cancel = () => plan && api.cancel(plan._id).catch((e) => warn(e.message));
   const tick = () => api.tick().then(loadHome).catch((e) => warn(e.message));
 
+  useEffect(() => {
+    if (!drawer) return;
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setDrawer(false);
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [drawer]);
+
+  const last = events[events.length - 1];
+  // A run is live until the manager's last word or a settled state. Not plan.running: the manager's loop returns
+  // (and clears it) while the agents it delegated to are still working.
+  const running = !!plan && !!last && !SETTLED.includes(plan.state) && !["reply", "ask", "error"].includes(last.action);
+  const phase = phaseOf(plan, events);
+  const work: Tab = tab === "chat" ? "basket" : tab;
+  const awaiting = plan?.state === "awaiting_approval";
+
   return (
     <MotionConfig reducedMotion="user">
-      <header className="top">
-        <h1>Сагс</h1>
-        <p>хүнсний туслах</p>
-        <motion.span className="state" data-s={plan?.state} layout aria-live="polite">
-          <AnimatePresence mode="wait" initial={false}>
-            <motion.span key={plan?.state ?? "new"} style={{ display: "inline-block" }}
-              initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.18 }}>
-              {plan ? stateName(plan.state) : "Шинэ"}
-            </motion.span>
-          </AnimatePresence>
-        </motion.span>
-        <span className="who">{user.name}</span>
-        <button type="button" className="quiet" aria-pressed={view === "settings"}
-          onClick={() => setView(view === "chat" ? "settings" : "chat")}>Тохиргоо</button>
-        <button type="button" className="quiet" onClick={onLogout}>Гарах</button>
-      </header>
-      {view === "settings" ? (
-        <main className="auth"><Settings user={user} onSaved={onUser} onClose={() => setView("chat")} /></main>
-      ) : (
-      <main>
-        <History plans={plans} current={planId} onPick={pick} />
-        <div className="col">
-          <Chat items={chat} onSend={send} onError={warn} />
-          <Timeline events={events} />
-        </div>
-        <div className="col right">
-          <Receipt plan={plan} onApprove={() => approve()} onCancel={cancel} />
-          <MapView branches={plan?.branches} />
-          <div className="home">
-            <Pantry items={pantry} onTick={tick} />
-            <Stats stats={stats} />
-          </div>
-        </div>
-      </main>
-      )}
+      <div className="app">
+        <header className="top">
+          <div className="brand"><h1>Сагс</h1><p>хүнсний туслах</p></div>
+          <RunStepper plan={plan} phase={phase} />
+          <nav aria-label="Бүртгэл">
+            <button type="button" className="secondary hist-btn" aria-expanded={drawer}
+              onClick={() => { setView("chat"); setDrawer(true); }}>Түүх</button>
+            <span className="who">{user.name}</span>
+            <button type="button" className="quiet d-only" aria-pressed={view === "settings"}
+              onClick={() => setView(view === "chat" ? "settings" : "chat")}>Тохиргоо</button>
+            <button type="button" className="secondary m-only" aria-pressed={view === "settings"}
+              onClick={() => setView(view === "chat" ? "settings" : "chat")}>Тохиргоо</button>
+            <button type="button" className="quiet d-only" onClick={onLogout}>Гарах</button>
+          </nav>
+        </header>
+
+        {view === "settings" ? (
+          <Settings user={user} onSaved={onUser} onClose={() => setView("chat")} onLogout={onLogout} />
+        ) : (
+          <>
+            <main className="board" data-tab={tab}>
+              <History plans={plans} current={planId} onPick={pick} open={drawer} onClose={() => setDrawer(false)} />
+              <Chat items={chat} onSend={send} onError={warn} steps={<Timeline events={events} running={running} />} />
+              <section className="panel work" aria-label="Ажлын талбар">
+                <div className="tabs" role="tablist">
+                  {WORK_TABS.map(([k, label]) => (
+                    <button key={k} type="button" role="tab" aria-selected={work === k} onClick={() => setTab(k)}>
+                      {label}{k === "basket" && awaiting && <span className="badge" aria-label="зөвшөөрөл хүлээж байна" />}
+                    </button>
+                  ))}
+                </div>
+                <div className="body" role="tabpanel">
+                  {work === "basket" && <Receipt plan={plan} running={running} stores={user.policy.allowed_stores} onCancel={cancel} />}
+                  {work === "route" && <MapView branches={plan?.branches} trip={plan?.trip} home={user.location.coordinates} receipts={plan?.receipts} />}
+                  {work === "pantry" && (
+                    <section className="section pantry" aria-label="Гэрт байгаа">
+                      <Pantry items={pantry} onTick={tick} />
+                      <Stats stats={stats} />
+                    </section>
+                  )}
+                </div>
+                {awaiting && plan?.basket && work === "basket" && (
+                  <div className="approve-bar">
+                    <button type="button" className="approve" onClick={() => approve()}>{fmt(plan.basket.total)} төлөхийг зөвшөөрөх</button>
+                    <button type="button" className="secondary" onClick={cancel}>Цуцлах</button>
+                  </div>
+                )}
+              </section>
+            </main>
+            <nav className="tabbar" role="tablist" aria-label="Хэсэг">
+              {PHONE_TABS.map(([k, label, Icon]) => (
+                <button key={k} type="button" role="tab" aria-selected={tab === k} onClick={() => setTab(k)}>
+                  <Icon />
+                  <span>{label}{k === "basket" && awaiting && <span className="badge" aria-label="зөвшөөрөл хүлээж байна" />}</span>
+                </button>
+              ))}
+            </nav>
+          </>
+        )}
+      </div>
     </MotionConfig>
   );
 }
@@ -173,7 +226,7 @@ export default function App() {
   }, []);
 
   if (user === undefined) return null;
-  if (!user) return <Auth onDone={loadUser} />;
+  if (!user) return <div className="app"><Auth onDone={loadUser} /></div>;
   // key: a different account starts with fresh chat/plan state
   return <Home key={user._id} user={user} onUser={setUser} onLogout={() => api.logout().catch(() => {}).then(() => setUser(null))} />;
 }

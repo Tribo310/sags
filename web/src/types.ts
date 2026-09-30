@@ -34,6 +34,14 @@ export interface Branch {
   route?: { km?: number; minutes?: number };
 }
 
+export interface Trip {
+  home: [number, number];  // [lon, lat]
+  km: number;
+  minutes: number;
+  stops: (Branch & { km: number; minutes: number })[];  // visiting order; km/minutes of the leg to the stop
+  geometry: [number, number][];  // road line, [lon, lat]
+}
+
 export interface Receipt {
   store: string;
   order_id: string;
@@ -50,6 +58,7 @@ export interface Plan {
   budget?: number;
   summary?: string | null;
   branches?: Branch[] | null;
+  trip?: Trip | null;
   receipts?: Receipt[];
   error?: string | null;
 }
@@ -91,7 +100,8 @@ export interface ChatItem {
   who: "user" | "agent";
   text: string;
   warn?: boolean;
-  action?: { label: string; send: string };
+  actions?: { label: string; send: string }[];
+  choice?: boolean;  // the manager's ask: one of actions must be picked
 }
 
 export interface User {

@@ -33,8 +33,13 @@ your instructions), reply plainly with what you can't do and why, and offer a no
 - The household raises (or lowers) the budget: set_budget first. "Raise it" without a number means the cheapest
   meal plan in the facts. Then procurement on the existing list (don't re-plan the meals) and propose_plan.
 - A question: advisor, then reply.
-- Where a store is, the nearest branch, how far, or the map: show_on_map (it draws the map), then reply with what it
-  found. Never state a store, price or place you didn't get from a tool.
+- A real choice only the household can make (a vague request, several ways to spend the budget, or what to drop
+  when it doesn't fit): ask, with 2-4 concrete options, e.g. "20,000₮: 10 eggs (≈X₮) or 5 breads (≈Y₮)?". Price
+  options with search_products first. Don't ask what the facts or the message already answer; one question, then act
+  on the answer.
+- Where a store is, the nearest branch, how far, the way to go, or the map: show_on_map (it plans one round trip
+  through the stores in the fastest order and draws it), then reply with the stops in order and the drive time. Never
+  state a store, price or place you didn't get from a tool.
 - A question about the current plan (what's in it, where an item is bought, how much, which meals): current_plan,
   then reply. Don't delegate for it: delegating replans and changes what the household is looking at.
 Write everything the household reads (reply, propose_plan summary) in the household's language.
@@ -128,23 +133,26 @@ async def nearest(ctx, stores):
 
 
 async def show_on_map(ctx, stores=None):
-    """Put stores' nearest branches on the household's map, any time in the chat, and say what's there."""
-    plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"basket": 1})
+    """Draw the drive on the household's map: home -> the stores' nearest branches in the fastest order -> home."""
+    plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"basket": 1, "receipts": 1})
     allowed = ctx["user"]["policy"]["allowed_stores"]
-    stores = [s for s in stores or list((plan.get("basket") or {}).get("stores") or {}) or allowed if s in allowed]
-    branches = await nearest(ctx, stores)
-    if not branches:
-        return {"error": "no branches found"}
-    await db.plans.update_one({"_id": ctx["plan_id"]}, {"$set": {"branches": branches}})  # the UI map follows
-    return {"on_map": [{"store": br["store"], "branch": br["name"], "address": br.get("address"),
-                        "hours": br.get("hours"), "km": (br.get("route") or {}).get("km"),
-                        "minutes": (br.get("route") or {}).get("minutes")} for br in branches]}
+    bought = [r["store"] for r in plan.get("receipts") or []]
+    stores = [s for s in stores or bought or list((plan.get("basket") or {}).get("stores") or {}) or allowed
+              if s in allowed]
+    lon, lat = ctx["user"]["location"]["coordinates"]
+    trip = await call_json(ctx["mcp"], "plan_trip", {"lon": lon, "lat": lat, "stores": stores})
+    if "error" in trip:
+        return trip
+    await db.plans.update_one({"_id": ctx["plan_id"]}, {"$set": {"trip": trip}})  # the UI map follows
+    return {"km": trip["km"], "minutes": trip["minutes"], "stops_in_order": [
+        {"store": s["store"], "branch": s["name"], "address": s.get("address"), "hours": s.get("hours"),
+         "km": s["km"], "minutes": s["minutes"]} for s in trip["stops"]]}
 
 
 async def current_plan(ctx):
     """What the household is looking at, read-only: each store's lines, the total, the meals and the map."""
     plan = await db.plans.find_one({"_id": ctx["plan_id"]}, {"basket": 1, "state": 1, "meals": 1, "branches": 1,
-                                                             "budget": 1, "shopping_list": 1})
+                                                             "budget": 1, "shopping_list": 1, "trip": 1})
     b = plan.get("basket") or {}
     if not b.get("stores"):
         return {"state": plan["state"], "plan": None, "note": "no basket yet"}
@@ -154,7 +162,9 @@ async def current_plan(ctx):
             "recipes": sorted({m["recipe"] for m in plan.get("meals") or []}),
             "from_home_not_bought": [p["name"] for p in (plan.get("shopping_list") or {}).get("from_pantry", [])],
             "branches": [{"store": br["store"], "branch": br["name"], "address": br.get("address")}
-                         for br in plan.get("branches") or []]}
+                         for br in plan.get("branches") or []],
+            **({"trip": {"km": plan["trip"]["km"], "minutes": plan["trip"]["minutes"],
+                         "stops_in_order": [s["name"] for s in plan["trip"]["stops"]]}} if plan.get("trip") else {})}
 
 
 def latin_share(text):
@@ -216,7 +226,7 @@ async def propose_plan(ctx, summary):
                          "the meals and the stores"}
     branches = await nearest(ctx, list(b["stores"]))  # map info is nice-to-have: never blocks the proposal
     await transition(ctx["plan_id"], "planning", "awaiting_approval", summary=summary, meals=plan.get("meals") or [],
-                     branches=branches, budget=budget)
+                     branches=branches, budget=budget, trip=None)
     await audit(ctx["plan_id"], "manager", "reply", result={"text": summary})
     return {"ok": True, "total": b["total"]}
 
@@ -224,6 +234,14 @@ async def propose_plan(ctx, summary):
 def states_total(summary, total):
     """Does the summary state the total? Digits only, so 122870, 122,870 and 122 870 all count."""
     return str(total) in "".join(c for c in summary if c.isdigit())
+
+
+async def ask(ctx, question, options):
+    """Ends the turn with a question; the UI shows the options as buttons and a tap sends one back as the answer."""
+    options = [o.strip() for o in options if o.strip()]
+    if not 2 <= len(options) <= 4:
+        return {"error": "give 2-4 options"}
+    return {"text": question, "options": options}
 
 
 async def reply(ctx, text):
@@ -269,8 +287,9 @@ async def agent(mcp):
              delegate_advisor, {"question": {"type": "string"}}, ["question"]),
         Tool("current_plan", "Read the current plan without changing it: each store's items with packs and prices, "
              "the total, the meals and the branches on the map.", current_plan),
-        Tool("show_on_map", "Show stores' nearest branches on the household's map with address, hours and drive "
-             "time. Default: the stores in the current basket, else all allowed stores.", show_on_map,
+        Tool("show_on_map", "Plan and draw the drive home -> stores' nearest branches (fastest order) -> home, with "
+             "address, hours and drive time per stop. Default: the stores ordered from, else the basket's, else all "
+             "allowed stores.", show_on_map,
              {"stores": {"type": "array", "items": {"type": "string", "enum": ["nomin", "emart", "sansar"]}}}),
         Tool("set_budget", "The household changes this plan's budget. 'Raise it' without a number: the "
              "cheapest_meal_plan in the facts. Capped at budget_limit.", change_budget,
@@ -283,6 +302,11 @@ async def agent(mcp):
              {"fact": {"type": "string"}}, ["fact"]),
         Tool("propose_plan", "Show the plan to the household for approval. Only after procurement returned a "
              "negotiated basket within budget.", propose_plan, {"summary": {"type": "string"}}, ["summary"], final=True),
+        *await mcp_tools(mcp, {"search_products"}),
+        Tool("ask", "Ask the household to choose, e.g. how to spend the budget. Ends your turn; their pick comes back "
+             "as the next message.", ask, {"question": {"type": "string"}, "options": {
+                 "type": "array", "items": {"type": "string"}, "description": "2-4 short options, with prices from "
+                 "search_products when they cost money."}}, ["question", "options"], final=True),
         Tool("reply", "Answer the household without proposing a plan: a question, or nothing to buy.", reply,
              {"text": {"type": "string"}}, ["text"], final=True),
     ])
