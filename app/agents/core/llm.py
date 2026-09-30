@@ -20,8 +20,9 @@ PROVIDERS = {  # name -> (base_url, api_key, model); a provider without a model 
 #   advisor       OpenAI: reads spending statistics and price series.
 #   store         OpenAI: pricing within hard limits against competitor prices.
 #   judge         OpenAI: evals/ grades the agents with a different model than the ones being graded.
+#   scout         OpenAI: matching messy store listings (Mongolian, Russian, brands, pack sizes) to catalog items.
 ROLES = {"manager": "oyullm", "meal_planner": "oyullm", "procurement": "openai", "advisor": "openai", "store": "openai",
-         "judge": "openai"}
+         "judge": "openai", "scout": "openai"}
 LOCKED = {"manager"}  # can't be moved off OyuLLM with MODEL_<ROLE>
 
 _clients = {}
@@ -42,7 +43,8 @@ def configured(name):
 
 def chain(role):
     """Providers to try for a role, best first: its own (MODEL_<ROLE> overrides the default), then OyuLLM, then local."""
-    own = ROLES.get(role, "oyullm") if role in LOCKED else os.getenv(f"MODEL_{role.upper()}", ROLES.get(role, "oyullm"))
+    locked = role in LOCKED and os.getenv("UNLOCK_MANAGER") != "1"  # unlock only to compare models in evals
+    own = ROLES.get(role, "oyullm") if locked else os.getenv(f"MODEL_{role.upper()}", ROLES.get(role, "oyullm"))
     return [p for p in dict.fromkeys([own, "oyullm", "ollama"]) if configured(p)]
 
 
@@ -85,3 +87,21 @@ async def chat(role, messages, tools, tool_choice=None):
         usage = {"prompt": r.usage.prompt_tokens, "completion": r.usage.completion_tokens} if r.usage else None
         return msg, model, usage
     raise err
+
+
+async def translate(text, source="en", target="mn"):
+    """Orchu, the oyu translation model: {text, source, target} -> {"translation"}. None when it isn't available.
+    ₮ is dropped by the model, so money goes through as "MNT" (it comes back as "төгрөг")."""
+    base, key, _ = PROVIDERS["oyullm"]
+    if not (base and key):
+        return None
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as h:
+            r = await h.post(f"{base.rstrip('/')}/translations", headers={"Authorization": f"Bearer {key}"},
+                             json={"text": text.replace("₮", " MNT"), "source": source, "target": target})
+        r.raise_for_status()
+        return r.json().get("translation") or None
+    except Exception as e:
+        print(f"translation failed: {e!r}")
+        return None

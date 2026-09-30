@@ -1,6 +1,7 @@
 """A store's sales agent: a ReAct loop that answers a shopper's basket with a counter-offer. The LLM decides what to
 offer; policy.py limits it, and the accepted prices are saved for reserve to honour."""
 import json
+import math
 import os
 import uuid
 from datetime import timedelta
@@ -55,10 +56,14 @@ async def make_offer(ctx, discounts, substitutes, message):
             "substitutes": subs, "message": message or (f"{len(offer)} бараанд хямдрал санал болгож байна." if offer else "")}
 
 
+MAX_SUBSTITUTES = 4  # items a store looks for replacements of; with a sparse real catalog it lacked dozens
+
+
 def agent(store, lines, lacking):
     """Tools whose arguments can only name what's in play: enums instead of free text. Before this, models searched
     for substitutes of made-up items ("fruit", "cake") over and over."""
     pol = policy(store)
+    lacking = lacking[:MAX_SUBSTITUTES]
     can_cut = sorted(k for k, l in lines.items() if discountable(pol, l))
     item = {"type": "object", "properties": {"key": {"type": "string", "enum": can_cut or [""]},
                                              "price": {"type": "integer"}}, "required": ["key", "price"]}
@@ -78,7 +83,7 @@ def agent(store, lines, lacking):
 async def rules(ctx, competitor):
     """No LLM (demo mode, or the model failed): undercut cheaper competitors, first substitute for each gap."""
     subs = []
-    for k in ctx["lacking"]:
+    for k in ctx["lacking"][:MAX_SUBSTITUTES]:
         if found := (await find_substitute(ctx["store"], k)).get("substitutes"):
             subs.append({"for_key": k, "key": found[0]["key"]})
     discounts = [{"key": k, "price": p} for k, p in rule_offer(policy(ctx["store"]), ctx["lines"], competitor).items()]
@@ -88,19 +93,21 @@ async def rules(ctx, competitor):
 
 
 async def negotiate(store, d):
-    """Counter-offer for {plan_id, items:[{key,qty}], competitor:{key: best other price}}."""
+    """Counter-offer for {plan_id, items:[{key, amount}], competitor:{key: best other price per unit}}."""
     keys = [i["key"] for i in d["items"]]
     prods = {p["key"]: p async for p in db.products.find({"store": store, "key": {"$in": keys}}, {"embedding": 0})}
-    lines, lacking = {}, []
+    lines, lacking, competitor = {}, [], {}
     for i in d["items"]:
-        p, qty = prods.get(i["key"]), int(i["qty"])
+        p = prods.get(i["key"])
+        qty = p and max(1, math.ceil(float(i["amount"]) / p["pack"] - 1e-9))
         if p and p["stock"] >= qty:
             lines[p["key"]] = {"name": p["name_mn"], "qty": qty, "price": p["price"], "stock": p["stock"]}
+            if (unit := (d.get("competitor") or {}).get(p["key"])) is not None:  # per unit -> per one of our packs
+                competitor[p["key"]] = round(unit * p["pack"])
         else:
             lacking.append(i["key"])
-    competitor = d.get("competitor") or {}
     ctx = {"plan_id": d["plan_id"], "store": store, "lines": lines, "lacking": lacking, "keys": keys}
-    if DEMO:
+    if DEMO or not lines:  # nothing of the basket on the shelf: no LLM needed to say so
         return await rules(ctx, competitor)
     pol = policy(store)
     view = [{"key": k, "name": l["name"], "qty": l["qty"], "your_price": l["price"], "stock": l["stock"],

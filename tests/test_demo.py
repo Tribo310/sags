@@ -83,3 +83,39 @@ def test_summary_must_state_the_real_total():
     from app.agents.manager import states_total
     assert states_total("Нийт 122,870₮", 122870) and states_total("нийт 122 870 төгрөг", 122870)
     assert not states_total("Meals for the week, total cost vs budget", 122870)
+
+
+def test_language_guard():
+    from app.agents.manager import cyrillic, wrong_language
+    assert cyrillic("овъёосны будаа хаанаас авах билээ") and not cyrillic("3-day plan: Буурцагтай шөл. Total 33,810")
+    assert wrong_language({"mongolian": True}, "3-day plan: Буурцагтай шөл, Ногооны шөл. Total 33,810 ₮, buy from Nomin")
+    assert wrong_language({"mongolian": True}, "Овъёосны будааг Номиноос 4,390₮-өөр авна.") is None
+    assert wrong_language({"mongolian": True}, "Sansar-аас 92,170 төгрөг, Emart-аас 48,380 төгрөг авна.") is None
+    assert wrong_language({"mongolian": False}, "3-day plan") is None
+
+
+def test_question_detection():
+    from app.agents.manager import QUESTION
+    for q in ("овъёосны будаа хаанаас авах билээ", "Нийт хэд вэ?", "Номиноос авч болох уу", "where is it?"):
+        assert QUESTION.search(q), q
+    for c in ("Номиноос авъя", "7 хоногийн хүнс, 2 хүн", "Цагаан хоол болгоод дахин гарга"):
+        assert not QUESTION.search(c), c
+
+
+def test_english_answer_to_mongolian_household_is_translated(monkeypatch):
+    import asyncio
+    from app.agents import manager
+    from app.agents.core import llm
+
+    async def orchu(text, source="en", target="mn"):
+        return "Нийт 33810 төгрөг, Номин, Эмартаас авна."
+    monkeypatch.setattr(llm, "translate", orchu)
+    ctx = {"mongolian": True}
+    assert asyncio.run(manager.in_their_language(ctx, "Total 33,810 MNT, buy from Nomin and Emart.")) == \
+        ("Нийт 33810 төгрөг, Номин, Эмартаас авна.", None)
+
+    async def down(text, source="en", target="mn"):
+        return None
+    monkeypatch.setattr(llm, "translate", down)
+    text, err = asyncio.run(manager.in_their_language(ctx, "Total 33,810 MNT"))
+    assert err and "Mongolian" in err["error"]  # Orchu down: the model is asked again

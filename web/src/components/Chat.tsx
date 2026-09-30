@@ -47,6 +47,7 @@ export default function Chat({ items, onSend, onError }: Props) {
             transition={{ type: "spring", stiffness: 400, damping: 30 }}
             style={{ transformOrigin: m.who === "user" ? "bottom right" : "bottom left" }}>
             {m.text}
+            {m.who === "agent" && !m.warn && m.text && <Speak text={m.text} onError={onError} />}
             {m.action && !used.has(m.id) && (
               <motion.button type="button" className="inline" whileTap={{ scale: 0.97 }} onClick={() => {
                 setUsed((s) => new Set(s).add(m.id));
@@ -101,5 +102,67 @@ function Mic({ onText, onError }: { onText: (t: string) => void; onError: (t: st
       animate={recording ? { scale: [1, 1.08, 1] } : { scale: 1 }}
       transition={recording ? { repeat: Infinity, duration: 1.2 } : undefined}
       aria-label={recording ? "Бичлэг зогсоох" : "Дуугаар хэлэх"}>{recording ? "⏹" : "🎤"}</motion.button>
+  );
+}
+
+
+/** tsuurAI takes at most 800 characters: split at sentence ends, then at spaces if a sentence is still too long. */
+export function chunks(text: string, max = 700): string[] {
+  const out: string[] = [];
+  let cur = "";
+  for (const s of text.match(/[^.!?\n]+[.!?\n]*/g) ?? [text]) {
+    if ((cur + s).length <= max) { cur += s; continue; }
+    if (cur.trim()) out.push(cur.trim());
+    cur = s;
+    while (cur.length > max) {
+      const cut = cur.lastIndexOf(" ", max) > 0 ? cur.lastIndexOf(" ", max) : max;
+      out.push(cur.slice(0, cut).trim());
+      cur = cur.slice(cut);
+    }
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+let playing: { stop: () => void } | null = null;  // one reply read aloud at a time
+
+/** Reads an agent reply aloud (tsuurAI), chunk by chunk; pressing again stops. */
+function Speak({ text, onError }: { text: string; onError: (t: string) => void }) {
+  const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
+  const me = useRef<{ stop: () => void } | null>(null);
+
+  const play = async () => {
+    if (state !== "idle") return me.current?.stop();
+    playing?.stop();
+    let stopped = false, audio: HTMLAudioElement | null = null;
+    const handle = { stop: () => { stopped = true; audio?.pause(); setState("idle"); } };
+    me.current = playing = handle;
+    setState("loading");
+    try {
+      const parts = chunks(text);
+      let next = api.tts(parts[0]);
+      for (let i = 0; i < parts.length && !stopped; i++) {
+        const wav = await next;
+        if (i + 1 < parts.length) next = api.tts(parts[i + 1]);  // fetch the next part while this one plays
+        if (stopped) break;
+        const url = URL.createObjectURL(wav);
+        audio = new Audio(url);
+        setState("playing");
+        await new Promise<void>((done) => { audio!.onended = () => done(); audio!.onpause = () => done(); audio!.play().catch(() => done()); });
+        URL.revokeObjectURL(url);
+      }
+    } catch (e) {
+      if (!stopped) onError(`Уншуулж чадсангүй: ${(e as Error).message}`);
+    } finally {
+      if (playing === handle) playing = null;
+      setState("idle");
+    }
+  };
+
+  const label = state === "idle" ? "Сонсох" : "Зогсоох";
+  return (
+    <button type="button" className={`speak ${state}`} onClick={play} aria-label={label} title={label}>
+      {state === "idle" ? "🔊" : state === "loading" ? "…" : "⏹"}
+    </button>
   );
 }

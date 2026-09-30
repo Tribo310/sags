@@ -42,6 +42,8 @@ main { display: grid; grid-template-columns: 220px minmax(320px, 1fr) minmax(360
 .msg.agent { background: var(--bg); border-bottom-left-radius: 4px; }
 .msg.warn { background: var(--red-soft); color: var(--red); }
 .msg .inline { display: block; margin-top: 8px; }
+.msg .speak { background: transparent; color: var(--mute); padding: 2px 6px; margin-left: 6px; font-size: 14px; vertical-align: middle; }
+.msg .speak:hover, .msg .speak.playing { color: var(--blue); background: var(--blue-soft); }
 .hello h2 { font-size: 20px; margin: 4px 0 6px; }
 .hello p { margin: 0 0 12px; color: var(--mute); }
 .hello button { display: block; margin: 0 0 8px; text-align: left; background: var(--blue-soft); color: var(--ink); font-weight: 400; }
@@ -123,6 +125,11 @@ main.auth { display: flex; justify-content: center; align-items: flex-start; hei
 .auth-card legend { font-weight: 500; padding: 0 4px; }
 .auth-card label.check { flex-direction: row; align-items: center; gap: 6px; font-weight: 400; }
 .auth-card .map { height: 200px; }
+.auth-card .favorites { gap: 8px; }
+.fav { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; border-radius: 99px; background: var(--bg); font-size: 14px; }
+.fav.liked { color: var(--ok); }
+.fav.no { color: var(--red); }
+.fav button { padding: 0 6px; color: var(--mute); }
 .tabs { display: flex; gap: 4px; }
 .top .who { color: var(--mute); font-size: 14px; }
 button:disabled { opacity: .6; cursor: default; }

@@ -16,8 +16,10 @@ mcp = MCPServer("grocery-mcp", instructions=(
     "Grocery planning tools for Ulaanbaatar households: profile and policy, recipe and product search, "
     "shopping-list aggregation, nearest store branches, driving routes and a policy-guarded sandbox wallet."))
 
-# Joins the cheapest product (any store) for a product key as field "p".
-CHEAPEST = {"from": "products", "foreignField": "key", "pipeline": [{"$sort": {"price": 1}}, {"$limit": 1}], "as": "p"}
+# Joins the cheapest product (any store) for a product key as field "p": by unit price, since stores sell the same
+# item in different packs (real products: 0.91 l vs 1 l of milk).
+CHEAPEST = {"from": "products", "foreignField": "key", "as": "p", "pipeline": [
+    {"$set": {"unit_price": {"$divide": ["$price", "$pack"]}}}, {"$sort": {"unit_price": 1}}, {"$limit": 1}]}
 
 
 class Meal(BaseModel):
@@ -54,16 +56,20 @@ async def get_profile(user_id: str) -> dict:
 
 @mcp.tool()
 async def search_recipes(query: str, exclude_tags: list[str] | None = None, limit: int = 8) -> dict:
-    """Semantic recipe search. exclude_tags removes e.g. ['pork']. Returns cost_per_serving at the cheapest known prices."""
+    """Semantic recipe search. exclude_tags removes e.g. ['pork']. Returns cost_per_serving at the cheapest known prices
+    and the ingredients no store sells (unavailable: those aren't in the cost)."""
     flt = {"tags": {"$nin": exclude_tags}} if exclude_tags else None
     return {"recipes": await agg(db.recipes, [
         *await vector_search("recipes_vec", query, limit, flt),
         {"$unwind": "$ingredients"},
         {"$lookup": {**CHEAPEST, "localField": "ingredients.key"}},
-        {"$unwind": "$p"},
+        {"$unwind": {"path": "$p", "preserveNullAndEmptyArrays": True}},  # real catalog: not every ingredient is sold
         {"$group": {"_id": "$_id", "name_mn": {"$first": "$name_mn"}, "name_en": {"$first": "$name_en"},
                     "tags": {"$first": "$tags"}, "score": {"$first": "$score"},
-                    "cost_per_serving": {"$sum": {"$multiply": ["$ingredients.qty", {"$divide": ["$p.price", "$p.pack"]}]}}}},
+                    "unavailable": {"$addToSet": {"$cond": [{"$eq": [{"$type": "$p"}, "missing"]}, "$ingredients.key",
+                                                            "$$REMOVE"]}},
+                    "cost_per_serving": {"$sum": {"$multiply": ["$ingredients.qty",
+                                                                {"$ifNull": [{"$divide": ["$p.price", "$p.pack"]}, 0]}]}}}},
         {"$set": {"cost_per_serving": {"$round": ["$cost_per_serving", 0]}}},
         {"$sort": {"score": -1}},
     ])}
@@ -111,8 +117,9 @@ async def build_list(user_id: str, meals: list[Meal]) -> dict:
         {"$set": {"need": "$amount", "amount": {"$max": [0, {"$subtract": [
             "$amount", {"$ifNull": [{"$first": "$have.amount"}, 0]}]}]}}},
         {"$lookup": {**CHEAPEST, "localField": "_id"}},
-        {"$unwind": "$p"},
-        {"$project": {"_id": 0, "key": "$_id", "name": "$p.name_mn", "category": "$p.category", "unit": "$p.unit",
+        {"$unwind": {"path": "$p", "preserveNullAndEmptyArrays": True}},  # not sold anywhere: reported, not dropped
+        {"$project": {"_id": 0, "key": "$_id", "name": {"$ifNull": ["$p.name_mn", "$_id"]}, "category": "$p.category",
+                      "unit": "$p.unit",
                       "amount": {"$round": ["$amount", 2]},
                       "from_pantry": {"$round": [{"$subtract": ["$need", "$amount"]}, 2]},
                       "qty": {"$toInt": {"$ceil": {"$round": [{"$divide": ["$amount", "$p.pack"]}, 6]}}},
@@ -122,10 +129,12 @@ async def build_list(user_id: str, meals: list[Meal]) -> dict:
     ])
     pantry = [{"key": i["key"], "name": i["name"], "used": i["from_pantry"], "unit": i["unit"]}
               for i in items if i["from_pantry"] > 0]
-    items = [i for i in items if i["qty"] > 0]
+    unavailable = [i["key"] for i in items if i.get("min_price") is None and i["amount"] > 0]
+    items = [i for i in items if i.get("min_price") is not None and i["qty"] > 0]
     found = await db.recipes.distinct("_id", {"_id": {"$in": ids}})
     return {"items": items, "from_pantry": pantry, "estimated_total": sum(i["est_cost"] for i in items),
             "budget": user["policy"]["budget"], "unknown_recipes": sorted(set(ids) - set(found)),
+            "unavailable": unavailable,  # needed, not at home, and no store sells it
             "policy_violations": check_items(user["policy"], items)}
 
 

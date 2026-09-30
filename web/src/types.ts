@@ -131,3 +131,11 @@ export interface PlanRow {
   total?: number | null;
   title?: string | null;
 }
+
+/** A dish the household told the agent it likes or won't eat; rule: a whole food turned diet rule (no_fish). */
+export interface Favorite {
+  id: string;
+  dish: string;
+  liked: boolean;
+  rule?: string | null;
+}
