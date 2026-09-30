@@ -114,6 +114,19 @@ async def agent_task(pid, text):
         await db.plans.update_one({"_id": pid}, {"$set": {"running": False}})
 
 
+@app.get("/plans")
+async def list_plans(uid: Uid):
+    """The caller's conversations, newest first, titled by their first message."""
+    return await agg(db.plans, [
+        {"$match": {"user_id": uid}},
+        {"$sort": {"created": -1}},
+        {"$limit": 50},
+        {"$lookup": {"from": "audit_log", "localField": "_id", "foreignField": "plan_id", "as": "first", "pipeline": [
+            {"$match": {"actor": "user", "action": "message"}}, {"$sort": {"ts": 1}}, {"$limit": 1}]}},
+        {"$project": {"state": 1, "created": 1, "total": "$basket.total", "title": {"$first": "$first.args.text"}}},
+    ])
+
+
 @app.get("/plans/{pid}")
 async def get_plan(pid: str, uid: Uid):
     return await own_plan(pid, uid, {"messages": 0, "quotes": 0})

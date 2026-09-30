@@ -101,7 +101,15 @@ export interface User {
   household: number;
   diet: string[];
   wallet: number;
-  policy: { budget: number };
+  location: { type: "Point"; coordinates: [number, number] };
+  policy: Policy;
+}
+
+export interface Policy {
+  budget: number;
+  approval_threshold: number;
+  max_stores: number;
+  allowed_stores: string[];
 }
 
 export interface RegisterIn {
@@ -112,4 +120,14 @@ export interface RegisterIn {
   diet: string[];
   budget: number;
   location: [number, number];  // [lon, lat]
+}
+
+export type ProfileIn = Omit<RegisterIn, "email" | "password"> & Omit<Policy, "budget">;
+
+export interface PlanRow {
+  _id: string;
+  state: State;
+  created: string;
+  total?: number | null;
+  title?: string | null;
 }

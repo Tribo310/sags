@@ -74,14 +74,49 @@ def current_user(access_token: Annotated[str | None, Cookie()] = None) -> str:
     return uid
 
 
+Diet = Literal["no_pork", "vegetarian"]
+Store = Literal["nomin", "emart", "sansar"]
+Location = tuple[Annotated[float, Field(ge=-180, le=180)], Annotated[float, Field(ge=-90, le=90)]]  # [lon, lat]
+POLICY_KEYS = ("budget", "approval_threshold", "max_stores", "allowed_stores")
+
+
 class RegisterIn(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=254)
     password: str = Field(min_length=8, max_length=128)
     name: str = Field(min_length=1, max_length=80, pattern=r"\S")
     household: int = Field(ge=1, le=20)
-    diet: list[Literal["no_pork", "vegetarian"]] = []
+    diet: list[Diet] = []
     budget: int = Field(ge=1000, le=10_000_000)
-    location: tuple[Annotated[float, Field(ge=-180, le=180)], Annotated[float, Field(ge=-90, le=90)]]  # [lon, lat]
+    location: Location
+
+
+class ProfileIn(BaseModel):
+    """Profile edit: every field optional, same bounds as RegisterIn plus the guardrails."""
+    name: str | None = Field(None, min_length=1, max_length=80, pattern=r"\S")
+    household: int | None = Field(None, ge=1, le=20)
+    diet: list[Diet] | None = None
+    location: Location | None = None
+    budget: int | None = Field(None, ge=1000, le=10_000_000)
+    approval_threshold: int | None = Field(None, ge=0, le=10_000_000)
+    max_stores: int | None = Field(None, ge=1, le=3)
+    allowed_stores: list[Store] | None = Field(None, min_length=1)
+
+
+def profile_update(body: ProfileIn, policy: dict) -> dict:
+    """$set for a profile edit. Policy fields go to dotted paths so the rest of the policy is kept."""
+    fields = body.model_dump(exclude_none=True)
+    merged = policy | {k: v for k, v in fields.items() if k in POLICY_KEYS}
+    if merged["approval_threshold"] > merged["budget"]:
+        raise ValueError(f"approval threshold {merged['approval_threshold']} is above the budget {merged['budget']}")
+    out = {}
+    for k, v in fields.items():
+        if k in POLICY_KEYS:
+            out[f"policy.{k}"] = list(dict.fromkeys(v)) if k == "allowed_stores" else v
+        elif k == "location":
+            out[k] = {"type": "Point", "coordinates": list(v)}
+        else:
+            out[k] = v.strip() if k == "name" else v
+    return out
 
 
 class LoginIn(BaseModel):
@@ -137,3 +172,17 @@ async def me(uid: Annotated[str, Depends(current_user)]):
     if not u:  # user removed (e.g. DEMO reseed) while the token is still valid
         raise HTTPException(401, "account not found")
     return u
+
+
+@router.patch("/me")
+async def update_me(body: ProfileIn, uid: Annotated[str, Depends(current_user)]):
+    u = await db.users.find_one({"_id": uid}, {"policy": 1})
+    if not u:
+        raise HTTPException(401, "account not found")
+    try:
+        upd = profile_update(body, u["policy"])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if upd:
+        await db.users.update_one({"_id": uid}, {"$set": upd})
+    return await me(uid)
