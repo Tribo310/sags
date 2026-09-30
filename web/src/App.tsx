@@ -56,10 +56,10 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
     if (ev.action === "state" && ["completed", "cancelled"].includes(r.to)) loadHome();
     if (ev.action === "state") loadPlans();
   };
-  const { plan, events } = usePlan(planId, onEvent, () => setChat([]));
+  const { plan, events, push, reset } = usePlan(planId);
 
   // Pantry change stream: offer a refill once per item when it is about to run out.
-  useEventSource<RefillAlert>("/me/alerts", (a) => {
+  const onRefill = (a: RefillAlert) => {
     loadHome();
     if (offered.current.has(a.key)) return;
     offered.current.add(a.key);
@@ -67,16 +67,28 @@ function Home({ user, onUser, onLogout }: { user: User; onUser: (u: User) => voi
       who: "agent", text: `${a.name} ${a.days_left} хоногийн дараа дуусна, ${a.amount} ${a.unit} үлдсэн.`,
       action: { label: `${a.name} захиалах`, send: `${a.name} дуусах гэж байна. 7 хоногийн хэрэгцээгээр нь захиалъя.` },
     });
-  });
+  };
 
   // Price change stream: a store cut a price by 10% or more.
-  useEventSource<PriceAlert>("/price-alerts", (a) => {
+  const onPrice = (a: PriceAlert) => {
     say({
       who: "agent",
       text: `${a.name} ${storeName(a.store)}-д ${a.pct}% хямдарлаа: ${fmt(a.old)} → ${fmt(a.new)}.${a.lowest_30d ? " Сүүлийн 30 хоногийн хамгийн бага үнэ." : ""}`,
       action: { label: "Дахин тооцоолох", send: `${a.name} ${storeName(a.store)}-д хямдарсан. Сагсаа дахин үнэлж, хэмнэлт гарвал шинэчил.` },
     });
-  });
+  };
+
+  // One live connection per tab for all three: browsers allow only 6 per host, and three streams each hung the
+  // page after a refresh or with a second tab open.
+  useEventSource<(AuditEvent | RefillAlert | PriceAlert) & { stream: "event" | "alert" | "price" }>(
+    `/me/stream${planId ? `?plan_id=${planId}` : ""}`,
+    (m) => {
+      if (m.stream === "event") { push(m as AuditEvent); onEvent(m as AuditEvent); }
+      else if (m.stream === "alert") onRefill(m as RefillAlert);
+      else onPrice(m as PriceAlert);
+    },
+    () => { reset(); setChat([]); },  // the server replays the plan's events on every (re)connect
+  );
 
   const send = async (text: string) => {
     try {
