@@ -8,31 +8,35 @@ export default function Stats({ stats }: { stats: StatsData | null }) {
   const t = stats?.totals;
   if (!stats || !t?.orders) {
     return (
-      <section className="card">
-        <h3>Зарцуулалт</h3>
+      <div className="spend">
+        <h2>Зарцуулалт</h2>
         <p className="empty">Эхний захиалгын дараа энд зарцуулалт, хэмнэлт харагдана.</p>
-      </section>
+      </div>
     );
   }
   const max = Math.max(...stats.by_store.map((x) => x.spent));
   return (
-    <section className="card">
-      <h3>Зарцуулалт</h3>
-      <p><b><Num value={t.spent} /></b>, {t.orders} захиалга, <span className="good"><Num value={t.saved} /> хэмнэлт</span></p>
-      <div className="bars">
-        {stats.by_store.map((x, i) => (
-          <div key={x.store}>
-            {storeName(x.store)} <Num value={x.spent} />
+    <div className="spend">
+      <h2>Зарцуулалт</h2>
+      <p className="total">
+        <span className="big"><Num value={t.spent} /></span>
+        <span>{t.orders} захиалга · <span className="good"><Num value={t.saved} /> хэмнэлт</span></span>
+      </p>
+      {stats.by_store.map((x, i) => (
+        <div key={x.store} className="sbar">
+          <div><span>{storeName(x.store)}</span><Num value={x.spent} /></div>
+          <span>
             <motion.i initial={{ width: 0 }} animate={{ width: `${(100 * x.spent) / max}%` }}
               transition={{ type: "spring", stiffness: 120, damping: 20, delay: 0.08 * i }} />
-          </div>
-        ))}
-      </div>
-      {stats.top_items.length > 0 && (
-        <table className="top-items"><tbody>
-          {stats.top_items.map((x) => <tr key={x.name}><td>{x.name}</td><td className="n"><Num value={x.spent} /></td></tr>)}
-        </tbody></table>
-      )}
-    </section>
+          </span>
+        </div>
+      ))}
+      {stats.top_items.length > 0 && <>
+        <h3 className="sub">Хамгийн их зарцуулсан</h3>
+        <div>
+          {stats.top_items.map((x) => <div key={x.name} className="trow"><span>{x.name}</span><Num value={x.spent} /></div>)}
+        </div>
+      </>}
+    </div>
   );
 }

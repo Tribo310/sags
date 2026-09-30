@@ -3,36 +3,49 @@ import { motion } from "motion/react";
 import type { PantryItem } from "../types";
 import Num from "./Num";
 
-const LOW_DAYS = 2;  // same threshold as the planner's refill alert
+const LOW_DAYS = 5;  // shown amber from here; the planner's refill alert fires later, at 2
+const FULL_DAYS = 14;  // a full bar
 const amount = (n: number) => String(Math.round(n * 100) / 100);
 
+/** What the household has, soonest to run out first; items with no consumption estimate listed apart, without a bar. */
 export default function Pantry({ items, onTick }: { items: PantryItem[]; onTick: () => void }) {
+  const timed = items.filter((i) => i.days_left !== null).sort((a, b) => a.days_left! - b.days_left!);
+  const rest = items.filter((i) => i.days_left === null);
   return (
-    <section className="card">
-      <h3>Гэрт байгаа <motion.button className="quiet" onClick={onTick} whileTap={{ scale: 0.95 }}>Нэг өдөр өнгөрөөх</motion.button></h3>
+    <>
+      <div className="headrow">
+        <h2>Гэрт байгаа</h2>
+        <motion.button type="button" className="secondary" onClick={onTick} whileTap={{ scale: 0.95 }}>Нэг өдөр өнгөрөөх</motion.button>
+      </div>
       {items.length === 0 && <p className="empty">Гэрт юу байгааг агентад хэлбэл энд харагдана.</p>}
-      <table><tbody>
-        {items.map((i) => {
-          const d = i.days_left, low = d !== null && d <= LOW_DAYS;
-          return (
-            <tr key={i.key}>
-              <td>
-                {i.name}
-                <div className={`days${low ? " low" : ""}`}>
-                  <div>
-                    <motion.i initial={false} animate={{ width: `${d === null ? 100 : Math.min(100, (d / 7) * 100)}%` }}
-                      transition={{ type: "spring", stiffness: 140, damping: 22 }} />
-                  </div>
-                  {d !== null && <motion.span key={String(low)} initial={low ? { scale: 1.3 } : false} animate={{ scale: 1 }}>
-                    <Num value={d} format={amount} /> хоног
-                  </motion.span>}
-                </div>
-              </td>
-              <td className="n"><Num value={i.amount} format={amount} /> {i.unit}</td>
-            </tr>
-          );
-        })}
-      </tbody></table>
-    </section>
+      {timed.length > 0 && (
+        <div className="plist">
+          {timed.map((i) => {
+            const d = i.days_left!, low = d < LOW_DAYS;
+            return (
+              <div key={i.key} className={`prow${low ? " low" : ""}`}>
+                <span>{i.name}</span>
+                <span className="num"><Num value={i.amount} format={amount} /> {i.unit}</span>
+                <span className="num days"><Num value={d} format={amount} /> хоног</span>
+                <span className="bar">
+                  <motion.i initial={false} animate={{ width: `${Math.min(100, (d / FULL_DAYS) * 100)}%` }}
+                    transition={{ type: "spring", stiffness: 140, damping: 22 }} />
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {rest.length > 0 && <>
+        <h3 className="sub">Хэрэглээний тооцоогүй</h3>
+        <div className="plist">
+          {rest.map((i) => (
+            <div key={i.key} className="prow rest">
+              <span>{i.name}</span><span className="num"><Num value={i.amount} format={amount} /> {i.unit}</span>
+            </div>
+          ))}
+        </div>
+      </>}
+    </>
   );
 }
