@@ -1,4 +1,4 @@
-import type { PantryItem, Plan, PlanRow, ProfileIn, RegisterIn, Stats, User } from "./types";
+import type { Favorite, PantryItem, Plan, PlanRow, ProfileIn, RegisterIn, Stats, User } from "./types";
 
 const NO_RETRY = ["/auth/login", "/auth/register", "/auth/refresh", "/auth/logout"];
 
@@ -36,6 +36,16 @@ async function call<T>(url: string, init?: RequestInit & { json?: unknown }): Pr
   return r.json();
 }
 
+/** Like call, for an audio (or other binary) answer. */
+async function blob(url: string, json: unknown): Promise<Blob> {
+  const send = () => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(json) });
+  let r = await send();
+  if (r.status === 401 && (await refresh())) r = await send();
+  if (r.status === 401) loggedOut();
+  if (!r.ok) throw new Error(await errText(r));
+  return r.blob();
+}
+
 export const api = {
   me: () => call<User>("/auth/me"),
   login: (email: string, password: string) => call<{ ok: boolean }>("/auth/login", { json: { email, password } }),
@@ -49,8 +59,11 @@ export const api = {
     call<{ ok?: boolean; needs_second_confirm?: boolean; total?: number }>(`/plans/${id}/approve`, { json: { version, confirm_high } }),
   cancel: (id: string) => call<{ ok: boolean }>(`/plans/${id}/cancel`, { method: "POST" }),
   pantry: () => call<{ pantry: PantryItem[] }>("/me/pantry"),
+  favorites: () => call<Favorite[]>("/me/favorites"),
+  forgetFavorite: (id: string) => call<{ ok: boolean }>(`/me/favorites/${id}`, { method: "DELETE" }),
   stats: () => call<Stats>("/me/stats"),
   tick: () => call<{ updated: number }>("/me/pantry/tick", { method: "POST" }),
+  tts: (text: string) => blob("/tts", { text }),
   stt: (audio: Blob) => {
     const fd = new FormData();
     fd.append("audio", audio, "voice.webm");

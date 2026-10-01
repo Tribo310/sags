@@ -42,7 +42,11 @@ async def run_case(h, case):
     pid = (await h.post("/chat", json={"text": case["text"]})).json()["plan_id"]
     for _ in range(WAIT):
         p = (await h.get(f"/plans/{pid}")).json()
-        if p.get("running") is False:  # the manager's run ended: a proposal, a reply or a failure
+        # ended = the flag is down AND the manager's run left its last step: another (older) planner process on a
+        # shared database may drop every running flag when it restarts, which once ended a case mid-run
+        done = await db.audit_log.find_one({"plan_id": pid, "actor": "manager",
+                                            "action": {"$in": ["reply", "propose_plan", "error"]}})
+        if p.get("running") is False and (done or p.get("state") == "failed"):
             break
         await asyncio.sleep(1)
     return pid, round(time.monotonic() - t0, 1)
@@ -60,14 +64,16 @@ async def checks(case, plan, trace):
     basket, meals = plan.get("basket") or {}, plan.get("meals") or []
     replied = [t for t in trace if t["action"] == "reply" and t["actor"] == "manager"]
     called = {t["actor"] for t in trace}
+    got = "plan" if plan["state"] == "awaiting_approval" else "reply" if replied else plan["state"]
     if "outcome" in e:
-        got = "plan" if plan["state"] == "awaiting_approval" else "reply" if replied else plan["state"]
         out.append(("outcome", got == e["outcome"], got))
-    if "days" in e and e.get("outcome") == "plan":
+    if "outcome_any" in e:
+        out.append(("outcome", got in e["outcome_any"], got))
+    if "days" in e and got == "plan" and e.get("outcome", "plan") == "plan":
         missing = [(d, m) for d in range(1, e["days"] + 1) for m in ("breakfast", "lunch", "dinner")
                    if not any(x["day"] == d and x["meal"] == m for x in meals)]
         out.append(("days_covered", not missing, f"{len(missing)} meals missing" if missing else "all"))
-    if e.get("no_tags") or e.get("only_tags"):
+    if (e.get("no_tags") or e.get("only_tags")) and meals:
         rs = await recipes_of(meals)
         bad = [r["name_mn"] for r in rs if set(r["tags"]) & set(e.get("no_tags", []))
                or not set(e.get("only_tags", [])) <= set(r["tags"])]
@@ -85,6 +91,15 @@ async def checks(case, plan, trace):
     if e.get("no_payment"):
         paid = [t for t in trace if t["actor"] in ("wallet", "checkout")]
         out.append(("no_payment", not paid and plan["state"] in ("planning", "awaiting_approval", "failed"), plan["state"]))
+    if "favorite_saved" in e:
+        ok = await db.favorites.find_one({"user_id": plan["user_id"], "recipe_id": e["favorite_saved"], "liked": True})
+        out.append(("favorite_saved", bool(ok), e["favorite_saved"]))
+    if "rule_saved" in e:
+        ok = await db.favorites.find_one({"user_id": plan["user_id"], "tag": e["rule_saved"], "liked": False})
+        out.append(("rule_saved", bool(ok), f"no_{e['rule_saved']}"))
+    if "includes_recipe" in e and got == "plan":
+        names = {m["recipe"] for m in meals}
+        out.append(("includes_recipe", e["includes_recipe"] in names, ", ".join(sorted(names))))
     for k in e.get("pantry_set", []):
         ok = any(t["action"] == "set_pantry" and (t.get("args") or {}).get("key") == k for t in trace)
         out.append((f"pantry_{k}", ok, ""))
@@ -121,8 +136,9 @@ async def judge(case, plan, trace):
     b = plan.get("basket") or {}
     truth = {"state": plan["state"], "budget": (plan.get("budget") or 150000), "total": b.get("total"),
              "stores": {s: sum(l["line_total"] for l in ls) for s, ls in (b.get("stores") or {}).items()},
-             "missing": b.get("missing"), "savings_vs_priciest_store": b.get("savings"),
-             "saved_by_negotiation": b.get("negotiated_savings"),
+             "missing": b.get("missing"), "saved_by_negotiation": b.get("negotiated_savings"),
+             **({"savings_vs_priciest_store": b["savings"]} if b.get("savings") else {}),
+             "cheapest_meal_plan": (plan.get("shopping_list") or {}).get("estimated_total"),
              "recipes": sorted({m["recipe"] for m in plan.get("meals") or []}),
              "from_pantry": [p.get("name") for p in (plan.get("shopping_list") or {}).get("from_pantry", [])],
              "agent_answers": [t["result"] for t in trace if t["action"] == "advisor" and t.get("result")]}

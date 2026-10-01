@@ -72,7 +72,7 @@ async def run(agent, ctx, task=None, messages=None, on_step=None):
     tools = {t.name: t for t in agent.tools}
     schemas = [t.schema() for t in agent.tools]
     chat = agent.script or llm.chat
-    last, stalls = None, 0
+    last, stalls, problem = None, 0, None
     for _ in range(agent.max_steps):
         t0 = time.monotonic()
         msg, model, usage = await chat(agent.role, compact(messages), schemas, "required")
@@ -108,6 +108,8 @@ async def run(agent, ctx, task=None, messages=None, on_step=None):
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {e}"}
             await audit(ctx["plan_id"], agent.actor, name, args=args, result=result, reason=thought, model=model, meta=meta)
+            if isinstance(result, dict) and result.get("error"):
+                problem = result["error"]
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": json.dumps(result, ensure_ascii=False, default=str)})
             if name in tools and tools[name].final and "error" not in result:
@@ -117,4 +119,5 @@ async def run(agent, ctx, task=None, messages=None, on_step=None):
         if answer is not None:
             return answer
     await audit(ctx["plan_id"], agent.actor, "error", result={"error": f"{agent.actor} gave up"})
-    return {"error": f"{agent.actor} could not finish the task"}
+    # the last problem it hit: "could not finish" alone made the manager tell the household it was "down"
+    return {"error": f"{agent.actor} could not finish the task" + (f"; last problem: {problem[:300]}" if problem else "")}

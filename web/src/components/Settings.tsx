@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { api } from "../api";
 import { DIETS, storeName } from "../i18n";
-import type { ProfileIn, User } from "../types";
+import type { Favorite, ProfileIn, User } from "../types";
 import { Check } from "./Icons";
 import PinPicker from "./PinPicker";
 
@@ -110,6 +110,8 @@ export default function Settings({ user, onSaved, onClose, onLogout }: Props) {
             ))}
           </fieldset>
 
+          <Favorites />
+
           <div className="card wide">
             <div className="ctitle"><span>Гэрийн байршил</span><span className="num">{lat.toFixed(4)}, {lon.toFixed(4)}</span></div>
             <PinPicker value={f.location} onChange={(location) => setF((s) => ({ ...s, location }))} />
@@ -122,5 +124,28 @@ export default function Settings({ user, onSaved, onClose, onLogout }: Props) {
         </div>
       </form>
     </div>
+  );
+}
+
+/** Dishes saved from the chat ("бид цуйванд дуртай"); removing one here takes it out of future plans. */
+function Favorites() {
+  const [items, setItems] = useState<Favorite[] | null>(null);
+  useEffect(() => { api.favorites().then(setItems, () => setItems([])); }, []);
+  const forget = async (id: string) => {
+    await api.forgetFavorite(id).catch(() => {});
+    setItems((xs) => (xs ?? []).filter((x) => x.id !== id));
+  };
+  return (
+    <fieldset className="card favorites">
+      <legend>Чатаас хадгалсан хоол</legend>
+      {items === null ? <span className="empty">…</span>
+        : items.length === 0 ? <span className="empty">Чатад "цуйванд дуртай", "загас иддэггүй" гэвэл энд нэмэгдэнэ.</span>
+        : items.map((f) => (
+          <span key={f.id} className={`fav ${f.liked ? "liked" : "no"}`}>
+            {f.liked ? "❤" : "✕"} {f.dish}{f.rule ? " (бүх хоолноос)" : ""}
+            <button type="button" className="quiet" aria-label={`${f.dish} устгах`} onClick={() => forget(f.id)}>×</button>
+          </span>
+        ))}
+    </fieldset>
   );
 }

@@ -6,6 +6,7 @@ build_list + finish."""
 from app.agents import demo
 from app.agents.core.react import Agent, Tool, run
 from app.agents.protocols.mcp import call_json, mcp_tools
+from app.common import favorites
 from app.common.db import db
 
 MEALS = ("breakfast", "lunch", "dinner")
@@ -18,7 +19,9 @@ you a task. Work step by step with your tools:
    cost_per_serving: stay near the target per serving in the facts.
 3. plan_meals: for each meal, the recipe _ids to rotate through the days (e.g. breakfast: [a], lunch: [b, c],
    dinner: [c, d]). Cheap recipes should repeat. It works out servings, subtracts the pantry, builds the shopping
-   list and checks the budget. If it says over budget, swap the priciest recipes for cheaper ones and call it again."""
+   list and checks the budget. If it says over budget, replace the recipes it names and call it again.
+Stores sell whole packs: every extra ingredient costs a whole pack (a bottle of soy sauce for a spoonful). Few
+recipes sharing the same ingredients are cheapest."""
 
 
 def expand(days, rotation):
@@ -41,20 +44,39 @@ async def search_recipes(ctx, query, limit=10):
                                                        "limit": max(int(limit), 10)})
     if "error" in r:
         return r
-    return {"recipes": [{k: x[k] for k in ("_id", "name_mn", "tags", "cost_per_serving")}
-                        for x in r["recipes"] if not diet_violation(ctx["diet"], x["tags"])]}
+    missing = ctx["liked"] - {x["_id"] for x in r["recipes"]}
+    if missing:  # favourites are always among the options, whatever the query was
+        names = [x["name_mn"] async for x in db.recipes.find({"_id": {"$in": list(missing)}}, {"name_mn": 1})]
+        more = await call_json(ctx["mcp"], "search_recipes", {"query": " ".join(names), "exclude_tags": exclude or None,
+                                                              "limit": 10})
+        r["recipes"] += [x for x in more.get("recipes", []) if x["_id"] in missing]
+    home = set(await db.pantry.distinct("key", {"user_id": ctx["user"]["_id"], "amount": {"$gt": 0}}))
+    # A recipe needing something no store sells (and not at home) can't be cooked from this list: not offered at all
+    # the household's favourites first and marked; dishes they won't eat are never offered
+    found = [{**{k: x[k] for k in ("_id", "name_mn", "tags", "cost_per_serving")},
+              **({"favorite": True} if x["_id"] in ctx["liked"] else {})}
+             for x in r["recipes"] if not diet_violation(ctx["diet"], x["tags"])
+             and not set(x.get("unavailable") or []) - home and x["_id"] not in ctx["disliked"]]
+    return {"recipes": sorted(found, key=lambda x: not x.get("favorite"))}
 
 
-async def plan_meals(ctx, breakfast, lunch, dinner, note=""):
+async def plan_meals(ctx, breakfast, lunch, dinner, note="", over_budget_ok=False):
     rotation = {"breakfast": breakfast, "lunch": lunch, "dinner": dinner}
     if empty := [m for m, ids in rotation.items() if not ids]:
         return {"error": f"give at least one recipe _id for {', '.join(empty)}"}
     ids = {i for v in rotation.values() for i in v}
-    recipes = {r["_id"]: r async for r in db.recipes.find({"_id": {"$in": list(ids)}}, {"name_mn": 1, "tags": 1})}
+    recipes = {r["_id"]: r async for r in db.recipes.find({"_id": {"$in": list(ids)}},
+                                                          {"name_mn": 1, "tags": 1, "ingredients.key": 1})}
     if unknown := sorted(ids - set(recipes)):  # models make up ids like "recipe_1"
         return {"error": f"unknown recipe ids {unknown}: use the _id values search_recipes returned"}
     if bad := {i: rule for i in ids if (rule := diet_violation(ctx["diet"], recipes[i]["tags"]))}:
         return {"error": f"these recipes break the diet: {bad}; pick others from search_recipes"}
+    if refused := sorted(ids & ctx["disliked"]):
+        return {"error": f"the household doesn't eat {refused}; pick others from search_recipes"}
+    if ctx["liked"] and not ids & ctx["liked"] and not ctx.get("favorite_nudged"):
+        ctx["favorite_nudged"] = True  # once: a favourite that can't fit the budget may be left out on the next call
+        return {"error": f"the household's favourites {sorted(ctx['liked'])} aren't in this plan: include at least one "
+                         "(search_recipes lists them) unless it can't fit the budget"}
     meals = expand(ctx["days"], rotation)
     counts = {}
     for m in meals:
@@ -63,17 +85,32 @@ async def plan_meals(ctx, breakfast, lunch, dinner, note=""):
         {"recipe_id": i, "servings": n * ctx["user"]["household"]} for i, n in counts.items()]})
     if "items" not in r:
         return r
-    if r["estimated_total"] > ctx["budget"]:
-        return {"error": f"estimated_total {r['estimated_total']} is over the budget {ctx['budget']}. Priciest items: "
-                         f"{', '.join(i['name'] for i in r['items'][:4])}. Swap the recipes that use them for cheaper "
-                         "ones and call plan_meals again"}
+    if r.get("unavailable"):  # the list would silently lack them
+        return {"error": f"no store sells {', '.join(r['unavailable'])} and it isn't at home: pick recipes without it"}
+    ctx["attempts"] = ctx.get("attempts", 0) + 1
+    best = ctx.get("cheapest")
+    if not best or r["estimated_total"] < best[0]:
+        ctx["cheapest"] = best = (r["estimated_total"], rotation)
+    if over_budget_ok and best[0] < r["estimated_total"]:  # hand back the cheapest try, not just the latest one
+        return await plan_meals(ctx, **best[1], note=note, over_budget_ok=True)
+    over = r["estimated_total"] > ctx["budget"]
+    if over and not (over_budget_ok and ctx["attempts"] >= 3):
+        # Name the recipes behind each pricey pack: "swap the priciest recipes" alone got the same plan back again.
+        used_by = lambda key: [i for i in counts if key in {g["key"] for g in recipes[i]["ingredients"]}]  # noqa: E731
+        culprits = [f"{i['name']} {i['est_cost']}₮ (for {', '.join(used_by(i['key']))})" for i in r["items"][:4]]
+        return {"error": f"estimated_total {r['estimated_total']} is over the budget {ctx['budget']}. Priciest packs: "
+                         f"{'; '.join(culprits)}. Replace those recipes, or reuse recipes you already have; call "
+                         "plan_meals again"
+                         + (". If it can't fit, pass over_budget_ok=true to hand back your cheapest plan"
+                            if ctx["attempts"] >= 2 else "")}
     named = [{**m, "recipe": recipes[m["recipe"]]["name_mn"]} for m in meals]
     r["budget"] = ctx["budget"]
     await db.plans.update_one({"_id": ctx["plan_id"], "state": "planning"},
                               {"$set": {"shopping_list": r, "meals": named}})
     return {"days": ctx["days"], "recipes": sorted({m["recipe"] for m in named}), "items_to_buy": len(r["items"]),
             "estimated_total": r["estimated_total"], "budget": ctx["budget"],
-            "from_pantry": [p["name"] for p in r["from_pantry"]], "nothing_to_buy": not r["items"], "note": note}
+            "from_pantry": [p["name"] for p in r["from_pantry"]], "nothing_to_buy": not r["items"], "note": note,
+            **({"over_budget": True, "cheapest_found": r["estimated_total"]} if over else {})}
 
 
 async def agent(mcp):
@@ -85,7 +122,9 @@ async def agent(mcp):
              {"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"]),
         Tool("plan_meals", "Final step: the recipes for each meal, rotated over the days. Builds the shopping list "
              "(minus the pantry) and checks the budget; saved for the procurement agent.", plan_meals,
-             {"breakfast": ids, "lunch": ids, "dinner": ids, "note": {"type": "string"}},
+             {"breakfast": ids, "lunch": ids, "dinner": ids, "note": {"type": "string"},
+              "over_budget_ok": {"type": "boolean", "description": "only after several over-budget tries: hand back "
+                                                                    "the cheapest plan you found anyway"}},
              ["breakfast", "lunch", "dinner"], final=True),
     ])
 
@@ -95,7 +134,9 @@ def brief(ctx, task):
     u, servings = ctx["user"], ctx["user"]["household"] * ctx["days"] * 3
     return (f"{task}\n\nFacts (from the system, authoritative):\n- days: {ctx['days']}, household: {u['household']} people, "
             f"diet: {', '.join(sorted(ctx['diet'])) or 'none'}\n- servings in total: about {servings}\n"
-            f"- budget: {ctx['budget']}₮, so recipes should average at most {ctx['budget'] * 0.9 // servings:.0f}₮ per serving")
+            f"- budget: {ctx['budget']}₮, so recipes should average at most {ctx['budget'] * 0.9 // servings:.0f}₮ per serving"
+            + (f"\n- favourite dishes (search_recipes marks them): include them when the budget allows: "
+               f"{', '.join(ctx['liked'])}" if ctx["liked"] else ""))
 
 
 async def delegate(ctx, task, days, diet=None):
@@ -103,6 +144,7 @@ async def delegate(ctx, task, days, diet=None):
     # A new meal plan replaces the old one: a failed run must not leave a list behind for procurement.
     await db.plans.update_one({"_id": ctx["plan_id"], "state": "planning"},
                               {"$unset": {"shopping_list": "", "meals": ""}})
-    ctx = {**ctx, "days": max(1, int(days)),
-           "diet": set(ctx["user"].get("diet", [])) | {d for d in diet or [] if d in DIETS}}
+    liked, disliked, rules, _ = await favorites.of(ctx["user"]["_id"])
+    ctx = {**ctx, "days": max(1, int(days)), "liked": liked, "disliked": disliked,
+           "diet": set(ctx["user"].get("diet", [])) | rules | {d for d in diet or [] if d in DIETS}}
     return await run(await agent(ctx["mcp"]), ctx, brief(ctx, task))

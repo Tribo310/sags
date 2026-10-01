@@ -34,9 +34,11 @@ class SoldOut(CheckoutError):
         self.name = name
 
 
-def cheapest_other(quotes, key, exclude):
-    offers = [(q[key]["price"], s) for s, q in quotes.items() if s not in exclude and key in q and q[key]["in_stock"]]
-    return min(offers)[::-1] if offers else None  # (store, price)
+def cheapest_other(quotes, key, qty, exclude):
+    """(store, price, packs) of the cheapest other store with the item in stock; its own pack count if it quoted one."""
+    offers = [(q[key]["price"] * q[key].get("qty", qty), s, q[key]["price"], q[key].get("qty", qty))
+              for s, q in quotes.items() if s not in exclude and key in q and q[key]["in_stock"]]
+    return min(offers)[1:] if offers else None
 
 
 async def undo(orders, payments, call_store, wallet, log):
@@ -86,11 +88,11 @@ async def checkout(plan, call_store, wallet, log):
             for l in lines:
                 if l["key"] not in missing:
                     continue
-                alt = cheapest_other(quotes, l["key"], tried | {store})
+                alt = cheapest_other(quotes, l["key"], l["qty"], tried | {store})
                 if alt is None:
                     raise SoldOut(l["name"])
-                s2, price = alt
-                moved.setdefault(s2, []).append({**l, "price": price, "line_total": price * l["qty"]})
+                s2, price, qty = alt
+                moved.setdefault(s2, []).append({**l, "qty": qty, "price": price, "line_total": price * qty})
                 await log("reroute", item=l["key"], name=l["name"], from_store=store, to_store=s2, price=price)
             queue += [(s2, ls, tried | {store}) for s2, ls in moved.items()]
 

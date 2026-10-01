@@ -5,6 +5,7 @@ import os
 import pathlib
 from datetime import timedelta
 
+from pymongo.errors import OperationFailure
 from pymongo.operations import SearchIndexModel
 
 from app.common.db import db, now
@@ -58,30 +59,41 @@ async def search_index(coll, name, type, definition):
 
 
 async def reset_household():
-    """The demo household back to its seeded pantry, memory, wallet and policy (evals run each case from here)."""
+    """The demo household back to its seeded pantry, memory, favourites, wallet and policy (evals start from here)."""
     by_key = {i["key"]: i for i in json.loads((D / "items.json").read_text())}
     await db.pantry.delete_many({"user_id": USER["_id"]})
     await db.pantry.insert_many([{"user_id": USER["_id"], "key": k, "name": by_key[k]["name_mn"], "unit": by_key[k]["unit"],
                                   "amount": amount, "daily_use": use} for k, (amount, use) in PANTRY.items()])
     await db.agent_memory.delete_many({"user_id": USER["_id"]})
+    await db.favorites.delete_many({"user_id": USER["_id"]})
     await db.users.update_one({"_id": USER["_id"]}, {"$set": {"wallet": USER["wallet"], "policy": USER["policy"]}})
 
 
-async def main():
+CATALOG = ("products", "recipes", "branches", "price_history", "offers")
+PEOPLE = ("users", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry", "favorites")
+
+
+async def main(catalog_only=False):
+    """Everything from scratch, or with catalog_only just the catalog: a shared database (Atlas) keeps its users,
+    plans and history, and the demo household is added if it's missing."""
     items = json.loads((D / "items.json").read_text())
     recipes = json.loads((D / "recipes.json").read_text())
     branches = json.loads((D / "branches.json").read_text())
 
-    for c in ("users", "products", "recipes", "branches", "orders", "payments", "plans", "audit_log", "agent_memory", "pantry", "price_history", "offers"):
+    for c in CATALOG if catalog_only else CATALOG + PEOPLE:
         await db.drop_collection(c)
 
-    await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
+    existing = await db.list_collection_names()
+    if "users" not in existing:
+        await db.create_collection("users", validator={"$jsonSchema": USER_SCHEMA})
     await db.users.create_index("email", unique=True)
-    await db.users.insert_one(USER)
+    if not await db.users.find_one({"_id": USER["_id"]}):
+        await db.users.insert_one(USER)
 
     # Pre-images let change streams see the old price (price alerts) and deleted orders (expired reservations).
     for c in ("products", "orders"):
-        await db.create_collection(c, changeStreamPreAndPostImages={"enabled": True})
+        if c not in existing or c in CATALOG:
+            await db.create_collection(c, changeStreamPreAndPostImages={"enabled": True})
     await db.create_collection("price_history", timeseries={"timeField": "ts", "metaField": "meta", "granularity": "hours"})
 
     vecs = await embed([f"{i['name_mn']} {i['name_en']} {i['category']}" for i in items])
@@ -106,7 +118,8 @@ async def main():
     await db.branches.insert_many([{**{k: v for k, v in b.items() if k != "lonlat"},
                                     "location": {"type": "Point", "coordinates": b["lonlat"]}} for b in branches])
 
-    await reset_household()
+    if not catalog_only or not await db.pantry.find_one({"user_id": USER["_id"]}):
+        await reset_household()
 
     await db.pantry.create_index([("user_id", 1), ("key", 1)], unique=True)
     await db.products.create_index([("store", 1), ("key", 1)], unique=True)
@@ -118,12 +131,19 @@ async def main():
     await db.offers.create_index("expires", expireAfterSeconds=0)  # store offers lapse by themselves
     await db.audit_log.create_index([("plan_id", 1), ("ts", 1)])
     await db.agent_memory.create_index([("user_id", 1), ("ts", -1)])
+    await db.favorites.create_index([("user_id", 1), ("ts", -1)])
     await vector_index(db.products, "products_vec", ["store"])
     await vector_index(db.recipes, "recipes_vec", ["tags"])
-    await search_index(db.products, "products_text", "search", {"mappings": {"dynamic": False, "fields": {
-        f: {"type": "string"} for f in ("name_mn", "name_en", "category")}}})
+    try:
+        await search_index(db.products, "products_text", "search", {"mappings": {"dynamic": False, "fields": {
+            f: {"type": "string"} for f in ("name_mn", "name_en", "category")}}})
+    except OperationFailure as e:  # Atlas M0 allows 3 search indexes per cluster, sample data may hold one
+        if e.code != 20:
+            raise
+        print("products_text skipped (search index limit): product search runs on vectors only, without typo tolerance")
     print(f"seeded {len(items) * len(STORES)} products, {len(recipes)} recipes, {len(branches)} branches")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    asyncio.run(main(catalog_only="--catalog" in sys.argv))

@@ -1,6 +1,7 @@
 """A2A store agent (run once per store: STORE=nomin PORT=9101). Stock and money skills are deterministic
 transactions; negotiate is the store's own LLM agent."""
 import asyncio
+import math
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -31,15 +32,22 @@ class OutOfStock(Exception):
         self.keys = keys
 
 
+def packs_for(amount, pack):
+    """This store's packs needed for an amount in the item's unit: 2 l of milk in 0.91 l packs is 3."""
+    return max(1, math.ceil(amount / pack - 1e-9))
+
+
 async def quote_basket(d):
+    """items: [{key, amount}] in the item's unit (l, kg, pcs). Each line is in this store's own packs."""
     keys = [i["key"] for i in d["items"]]
     prods = {p["key"]: p async for p in db.products.find({"store": STORE, "key": {"$in": keys}}, {"embedding": 0})}
     lines = []
     for i in d["items"]:
-        p, qty = prods.get(i["key"]), int(i["qty"])
+        p = prods.get(i["key"])
         if p:
+            qty = packs_for(float(i["amount"]), p["pack"])
             lines.append({"key": p["key"], "name": p["name_mn"], "category": p["category"], "price": p["price"],
-                          "qty": qty, "in_stock": p["stock"] >= qty})
+                          "pack": p["pack"], "unit": p["unit"], "qty": qty, "in_stock": p["stock"] >= qty})
     return {"ok": True, "store": STORE, "lines": lines}
 
 
@@ -141,9 +149,11 @@ card = AgentCard(
     capabilities=AgentCapabilities(),
     default_input_modes=["application/json"], default_output_modes=["application/json"],
     skills=[
-        skill("quote_basket", "Price and stock for {items:[{key,qty}]}"),
+        skill("quote_basket", "Price and stock for {items:[{key, amount}]}, amount in the item's unit; lines come in "
+              "this store's own packs."),
         skill("negotiate", "Counter-offer for a basket, decided by this store's own agent: "
-              "{plan_id, items:[{key,qty}], competitor:{key: best other price}}. Returns offer_id, discounts, substitutes."),
+              "{plan_id, items:[{key, amount}], competitor:{key: best other price per unit}}. Returns offer_id, discounts, "
+              "substitutes."),
         skill("reserve", "Atomically reserve stock: {plan_id, idempotency_key, items, offer_id?}. "
               "Uses the offer's prices. Returns order_id or missing keys."),
         skill("place_order", "Confirm a reserved order after payment: {order_id, payment_id}. Returns receipt."),

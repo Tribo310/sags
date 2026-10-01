@@ -9,9 +9,9 @@ from typing import Annotated
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.common.db import agg, audit, db, now
 from app.common.state import StateConflict, reopen, transition
@@ -26,15 +26,48 @@ PRICE_DROP = 0.10  # alert when a price falls by at least this fraction
 Uid = Annotated[str, Depends(current_user)]
 
 
-@asynccontextmanager
-async def lifespan(app):
-    print("store agents:", await stores.discover())
-    await db.plans.update_many({"running": True}, {"$set": {"running": False}})  # loops died with the old process
+# Several planner processes can share one database (Atlas: teammates, tests). Each owns the plans it works on and
+# renews a lease on them; only a plan whose lease went stale (its process died) is reset or rolled back. Resetting
+# every running plan at startup, as before, stopped other processes' agents and refunded their live checkouts.
+INSTANCE = uuid.uuid4().hex
+LEASE_EVERY, LEASE_STALE = 30, timedelta(minutes=2)
+
+
+def owned():
+    return {"owner": INSTANCE, "lease": now()}
+
+
+def stale():
+    return {"$or": [{"lease": {"$lt": now() - LEASE_STALE}}, {"lease": {"$exists": False}}]}
+
+
+async def reclaim():
+    """Plans whose process died: agent loops marked stopped, checkouts rolled back."""
+    await db.plans.update_many({"running": True, **stale()}, {"$set": {"running": False}})
     try:
         await recover()
     except Exception as e:
-        print(f"checkout recovery failed, will retry on next start: {e}")
+        print(f"checkout recovery failed, will retry: {e}")
+
+
+async def keep_leases():
+    while True:
+        await asyncio.sleep(LEASE_EVERY)
+        try:
+            await db.plans.update_many({"owner": INSTANCE, "$or": [{"running": True}, {"state": "checking_out"}]},
+                                       {"$set": {"lease": now()}})
+            await reclaim()
+        except Exception as e:
+            print(f"lease renewal failed: {e!r}")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    print("store agents:", await stores.discover())
+    await reclaim()
+    task = asyncio.create_task(keep_leases())
     yield
+    task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -75,7 +108,7 @@ async def claim(pid):
     approval stays proposed while the agent answers; it's reopened only if the agent changes it (manager.replan)."""
     return await db.plans.find_one_and_update(
         {"_id": pid, "state": {"$in": ["planning", "awaiting_approval"]}, "running": {"$ne": True}},
-        {"$set": {"running": True}})
+        {"$set": {"running": True, **owned()}})
 
 
 async def own_plan(pid, uid, projection=None):
@@ -97,7 +130,7 @@ async def chat(body: ChatIn, bg: BackgroundTasks, uid: Uid):
             raise HTTPException(409, "the agent is still working on this plan, or it can't be changed any more")
     else:
         pid = uuid.uuid4().hex
-        await db.plans.insert_one({"_id": pid, "user_id": uid, "state": "planning", "version": 1, "running": True,
+        await db.plans.insert_one({"_id": pid, "user_id": uid, "state": "planning", "version": 1, "running": True, **owned(),
                                    "created": now(), "history": [{"state": "planning", "ts": now()}]})
     await audit(pid, "user", "message", args={"text": body.text})
     bg.add_task(agent_task, pid, body.text)
@@ -170,8 +203,8 @@ def logger(pid, actor):
 
 
 async def recover():
-    """The planner died mid-checkout: undo whatever was reserved or paid and fail the plan."""
-    async for plan in db.plans.find({"state": "checking_out"}):
+    """A planner died mid-checkout (its lease went stale): undo whatever was reserved or paid and fail the plan."""
+    async for plan in db.plans.find({"state": "checking_out", **stale()}):
         pid = plan["_id"]
         orders = [{"store": o["store"], "order_id": o["_id"]}
                   async for o in db.orders.find({"plan_id": pid, "status": {"$in": ["reserved", "placed"]}})]
@@ -182,7 +215,7 @@ async def recover():
 
 
 async def checkout_task(pid):
-    plan = await transition(pid, "approved", "checking_out")
+    plan = await transition(pid, "approved", "checking_out", **owned())
     try:
         async with connect() as mcp:
             receipts = await checkout(plan, stores.call, Wallet(mcp), logger(pid, "checkout"))
@@ -263,6 +296,26 @@ async def stats(uid: Uid):
     return await mcp_tool("spending_stats", {"user_id": uid})
 
 
+@app.get("/me/favorites")
+async def my_favorites(uid: Uid):
+    """Dishes the household told the agent it likes or won't eat (saved from the chat)."""
+    return [{"id": str(f["_id"]), "dish": f.get("recipe") or f["dish"], "liked": f["liked"], "rule": f.get("tag") and f"no_{f['tag']}"}
+            async for f in db.favorites.find({"user_id": uid}).sort("ts", -1)]
+
+
+@app.delete("/me/favorites/{fid}")
+async def forget_favorite(fid: str, uid: Uid):
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    try:
+        r = await db.favorites.delete_one({"_id": ObjectId(fid), "user_id": uid})
+    except InvalidId:
+        raise HTTPException(404)
+    if not r.deleted_count:
+        raise HTTPException(404)
+    return {"ok": True}
+
+
 @app.get("/me/pantry")
 async def pantry(uid: Uid):
     return await mcp_tool("get_pantry", {"user_id": uid})
@@ -337,14 +390,44 @@ async def live(uid: Uid, plan_id: str | None = None):
     return StreamingResponse(merged(sources), media_type="text/event-stream")
 
 
+class TtsIn(BaseModel):
+    text: str = Field(min_length=1, max_length=800)  # tsuurAI's limit; the UI splits longer replies
+
+
+TTS_VOICE = os.getenv("TTS_VOICE", "mbspeech")  # mbspeech (Khalkha) · baseline · mn1h
+_spoken: dict[str, bytes] = {}  # text -> wav: a reply is often played again
+
+
+@app.post("/tts")
+async def tts(body: TtsIn, _: Uid):
+    """Text to speech via tsuurAI (oyu API): POST {base}/audio/speech {text, voice} -> audio/wav."""
+    base = os.getenv("OYUVOICE_URL", "").rstrip("/").removesuffix("/audio/transcriptions")
+    if not base:
+        raise HTTPException(503, "voice output is not configured (OYUVOICE_URL)")
+    text = " ".join(body.text.replace("₮", " төгрөг").split())
+    if text not in _spoken:
+        async with httpx.AsyncClient(timeout=60) as h:
+            r = await h.post(f"{base}/audio/speech", json={"text": text, "voice": TTS_VOICE},
+                             headers={"Authorization": f"Bearer {os.getenv('OYUVOICE_API_KEY', '')}"})
+        if r.status_code != 200 or not r.headers.get("content-type", "").startswith("audio"):
+            raise HTTPException(502, f"voice service answered {r.status_code}: {r.text[:200]}")
+        if len(_spoken) > 200:
+            _spoken.clear()
+        _spoken[text] = r.content
+    return Response(_spoken[text], media_type="audio/wav")
+
+
 @app.post("/stt")
 async def stt(audio: UploadFile, _: Uid):
-    # ADJUST to the OyuVoice API (Task 1 Step 3): endpoint, auth header, field name, response path.
-    if not os.getenv("OYUVOICE_URL"):
+    """Speech to text via OyuVoice: OpenAI-style POST {base}/audio/transcriptions, multipart "file" -> {"text"}.
+    Takes the browser's webm/opus recording as is."""
+    base = os.getenv("OYUVOICE_URL", "").rstrip("/")
+    if not base:
         raise HTTPException(503, "voice input is not configured (OYUVOICE_URL)")
+    url = base if base.endswith("/audio/transcriptions") else f"{base}/audio/transcriptions"
     async with httpx.AsyncClient(timeout=60) as h:
-        r = await h.post(os.environ["OYUVOICE_URL"],
-                         headers={"Authorization": f"Bearer {os.getenv('OYUVOICE_API_KEY', '')}"},
+        r = await h.post(url, headers={"Authorization": f"Bearer {os.getenv('OYUVOICE_API_KEY', '')}"},
                          files={"file": (audio.filename, await audio.read(), audio.content_type)})
-    r.raise_for_status()
+    if r.status_code != 200:  # a clear message for the chat instead of a 500 traceback
+        raise HTTPException(502, f"voice service answered {r.status_code}: {r.text[:200]}")
     return {"text": r.json().get("text", "")}

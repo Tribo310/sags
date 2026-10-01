@@ -364,3 +364,14 @@ input { font: inherit; color: var(--ink); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* read a reply aloud (tsuurAI) */
+.msg .speak { background: transparent; color: var(--mute); padding: 2px 6px; margin-left: 6px; font-size: 14px; vertical-align: middle; min-height: 0; height: auto; }
+.msg .speak:hover, .msg .speak.playing { color: var(--blue); background: var(--blue-soft); }
+
+/* dishes saved from the chat (settings) */
+.settings .favorites { display: flex; flex-flow: row wrap; gap: 8px; align-items: center; align-content: flex-start; }
+.fav { flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; border-radius: 99px; background: var(--paper-2, var(--bg)); font-size: 14px; }
+.fav.liked { color: var(--ok); }
+.fav.no { color: var(--red); }
+.fav button { padding: 0 6px; color: var(--mute); min-height: 0; height: auto; }

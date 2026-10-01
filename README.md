@@ -56,6 +56,36 @@ approve ─> checkout saga (code, not an LLM): reserve -> wallet hold -> place o
 - **Store negotiation:** each store sees its competitors' prices, looks for substitutes in its own catalog (vector
   search) and makes an offer. The offer is saved in `offers` (TTL), and `reserve` charges the agreed price.
 
+## Real prices: the price scout
+
+`app/agents/scout/` collects real products and prices from the stores' own public web endpoints. It runs from the
+command line, not inside a household's request:
+
+- **Nomin:** reads the grocery collections (about 5,300 products) from the route the site's category pages use.
+- **Emart:** uses the site's own search, one query per catalog item.
+- **Sansar:** has no online shop, so it sells nothing in the catalog.
+
+The requests use an identified user agent and are spaced 2 s apart.
+
+**How matching works:**
+1. Code picks candidates for each catalog item with a keyword filter, then embedding similarity.
+2. The scout agent (ReAct, OpenAI) decides which candidate is the same everyday product, and reads its pack size in
+   our unit (for example "910гр" of milk is 0.91 l).
+3. Code checks plausibility. Unsure or implausible matches go to a review queue and are not applied.
+4. Accepted matches are written to `products` exactly as the store sells them: name, pack, price, sku, url.
+   Products sold by weight use 100 g steps at the real per-kg price.
+
+Anything without a real match is removed, including simulated price history. Stores quote in their own packs:
+2 l of milk is 3 packs of 0.91 l at one store and 2 packs of 1 l at another.
+
+```bash
+uv run --env-file .env python -m seed.seed --catalog          # catalog only: keeps users, plans, history
+uv run --env-file .env python -m app.agents.scout --dry-run   # crawl + match, show results, change nothing
+uv run --env-file .env python -m app.agents.scout             # crawl + match + write real products
+```
+
+Raw listings are stored in `crawl_raw`, and every decision (with the agent's reason) in `crawl_matches`.
+
 ## Evaluation
 
 `evals/cases.json` holds scenarios: a week plan, a stated budget, a vegetarian week, a refill, a price question, a

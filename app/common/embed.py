@@ -2,7 +2,9 @@ import os
 
 from openai import AsyncOpenAI
 
-_client = AsyncOpenAI(base_url=os.getenv("EMBED_BASE_URL", "http://localhost:11434/v1"), api_key="ollama")
+# bge-m3 locally (Ollama) or on the oyu API: the same model gives the same vectors, so stored ones stay valid
+_client = AsyncOpenAI(base_url=os.getenv("EMBED_BASE_URL", "http://localhost:11434/v1"),
+                      api_key=os.getenv("EMBED_API_KEY") or "ollama")
 MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 DIMS = int(os.getenv("EMBED_DIMS", "1024"))
 
