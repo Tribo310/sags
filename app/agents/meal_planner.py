@@ -3,11 +3,14 @@
 The model chooses recipes; code does the bookkeeping it kept getting wrong (evals/): expanding a rotation over the
 days, servings per recipe, diet rules and the budget check all live in plan_meals, one final tool instead of
 build_list + finish."""
+import hashlib
+import json
+
 from app.agents import demo
 from app.agents.core.react import Agent, Tool, run
 from app.agents.protocols.mcp import call_json, mcp_tools
 from app.common import favorites
-from app.common.db import db
+from app.common.db import audit, db, now
 
 MEALS = ("breakfast", "lunch", "dinner")
 DIETS = ["vegetarian", "no_pork", "no_fish", "no_beef", "no_mutton", "no_chicken"]
@@ -104,6 +107,7 @@ async def plan_meals(ctx, breakfast, lunch, dinner, note="", over_budget_ok=Fals
                          + (". If it can't fit, pass over_budget_ok=true to hand back your cheapest plan"
                             if ctx["attempts"] >= 2 else "")}
     named = [{**m, "recipe": recipes[m["recipe"]]["name_mn"]} for m in meals]
+    ctx["chosen"] = None if over else rotation  # what the plan cache keeps
     r["budget"] = ctx["budget"]
     await db.plans.update_one({"_id": ctx["plan_id"], "state": "planning"},
                               {"$set": {"shopping_list": r, "meals": named}})
@@ -139,6 +143,34 @@ def brief(ctx, task):
                f"{', '.join(ctx['liked'])}" if ctx["liked"] else ""))
 
 
+async def cache_key(ctx):
+    """Everything a meal plan depends on, exactly: the household's own words, the plan's numbers and diet, its
+    favourites, what's at home and which day's prices. A semantic match was tried and rejected: "60 мянга" and
+    "6 мянга" embed at 0.94, closer than two phrasings of the same question."""
+    home = sorted([(p["key"], round(p["amount"], 2))
+                   async for p in db.pantry.find({"user_id": ctx["user"]["_id"], "amount": {"$gt": 0}})])
+    prices = await db.scout_runs.find_one({"ok": True}, sort=[("ts", -1)])
+    raw = json.dumps({"text": " ".join(ctx.get("text", "").lower().split()), "days": ctx["days"],
+                      "household": ctx["user"]["household"], "diet": sorted(ctx["diet"]), "budget": ctx["budget"],
+                      "liked": sorted(ctx["liked"]), "disliked": sorted(ctx["disliked"]), "home": home,
+                      "prices": str(prices and prices["ts"])}, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def from_cache(ctx, key):
+    """The same request as before: reuse the dishes, rebuild the list and budget check on today's numbers."""
+    hit = await db.plan_cache.find_one({"_id": key})
+    if not hit:
+        return None
+    r = await plan_meals(ctx, **hit["rotation"], note="same request as before: dishes reused")
+    if "error" in r or r.get("over_budget"):
+        return None
+    await audit(ctx["plan_id"], "meal_planner", "plan_meals", args=hit["rotation"], result=r, model="cache",
+                reason="Same request, household, pantry and prices as an earlier plan: reused its dishes; the list and "
+                       "the budget check were rebuilt now.")
+    return r
+
+
 async def delegate(ctx, task, days, diet=None):
     """diet: rules for this plan on top of the profile's (e.g. a vegetarian week)."""
     # A new meal plan replaces the old one: a failed run must not leave a list behind for procurement.
@@ -147,4 +179,11 @@ async def delegate(ctx, task, days, diet=None):
     liked, disliked, rules, _ = await favorites.of(ctx["user"]["_id"])
     ctx = {**ctx, "days": max(1, int(days)), "liked": liked, "disliked": disliked,
            "diet": set(ctx["user"].get("diet", [])) | rules | {d for d in diet or [] if d in DIETS}}
-    return await run(await agent(ctx["mcp"]), ctx, brief(ctx, task))
+    first = ctx.get("meal_plans", 1) <= 1 and ctx.get("text")  # a second try comes with changes: plan afresh
+    key = await cache_key(ctx) if first else None
+    if key and (hit := await from_cache(ctx, key)):
+        return hit
+    result = await run(await agent(ctx["mcp"]), ctx, brief(ctx, task))
+    if key and "error" not in result and ctx.get("chosen"):
+        await db.plan_cache.replace_one({"_id": key}, {"rotation": ctx["chosen"], "ts": now()}, upsert=True)
+    return result

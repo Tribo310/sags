@@ -45,7 +45,7 @@ async def run_case(h, case):
         # ended = the flag is down AND the manager's run left its last step: another (older) planner process on a
         # shared database may drop every running flag when it restarts, which once ended a case mid-run
         done = await db.audit_log.find_one({"plan_id": pid, "actor": "manager",
-                                            "action": {"$in": ["reply", "propose_plan", "error"]}})
+                                            "action": {"$in": ["reply", "propose_plan", "error", "ask"]}})
         if p.get("running") is False and (done or p.get("state") == "failed"):
             break
         await asyncio.sleep(1)
@@ -64,7 +64,9 @@ async def checks(case, plan, trace):
     basket, meals = plan.get("basket") or {}, plan.get("meals") or []
     replied = [t for t in trace if t["action"] == "reply" and t["actor"] == "manager"]
     called = {t["actor"] for t in trace}
-    got = "plan" if plan["state"] == "awaiting_approval" else "reply" if replied else plan["state"]
+    last = next((t["action"] for t in reversed(trace)
+                 if t["actor"] == "manager" and t["action"] in ("reply", "ask", "propose_plan")), None)
+    got = "plan" if plan["state"] == "awaiting_approval" else "ask" if last == "ask" else "reply" if replied else plan["state"]
     if "outcome" in e:
         out.append(("outcome", got == e["outcome"], got))
     if "outcome_any" in e:
@@ -100,6 +102,12 @@ async def checks(case, plan, trace):
     if "includes_recipe" in e and got == "plan":
         names = {m["recipe"] for m in meals}
         out.append(("includes_recipe", e["includes_recipe"] in names, ", ".join(sorted(names))))
+    if got == "plan" and (plan.get("shopping_list") or {}).get("items"):
+        # every case: what the meals need is in the basket (bean soup without beans got proposed once)
+        listed = {i["key"] for i in plan["shopping_list"]["items"]}
+        bought = {l["key"] for ls in basket.get("stores", {}).values() for l in ls}
+        lost = sorted(listed - bought - set(basket.get("missing") or []))
+        out.append(("list_in_basket", not lost, ", ".join(lost) or "all"))
     for k in e.get("pantry_set", []):
         ok = any(t["action"] == "set_pantry" and (t.get("args") or {}).get("key") == k for t in trace)
         out.append((f"pantry_{k}", ok, ""))
@@ -130,7 +138,8 @@ def grounded(plan, trace):
 
 
 async def judge(case, plan, trace):
-    replies = [t["result"]["text"] for t in trace if t["action"] == "reply" and (t.get("result") or {}).get("text")]
+    replies = [t["result"]["text"] for t in trace
+               if t["action"] in ("reply", "ask") and (t.get("result") or {}).get("text")]
     if not replies:
         return {"faithful": False, "fulfils": False, "score": 1, "issues": ["no reply to the household"]}
     b = plan.get("basket") or {}
@@ -141,7 +150,8 @@ async def judge(case, plan, trace):
              "cheapest_meal_plan": (plan.get("shopping_list") or {}).get("estimated_total"),
              "recipes": sorted({m["recipe"] for m in plan.get("meals") or []}),
              "from_pantry": [p.get("name") for p in (plan.get("shopping_list") or {}).get("from_pantry", [])],
-             "agent_answers": [t["result"] for t in trace if t["action"] == "advisor" and t.get("result")]}
+             "agent_answers": [t["result"] for t in trace if t["action"] in ("advisor", "cook_from_home", "current_plan")
+                               and t.get("result")]}
     rubric = f"Case-specific: {case['rubric']}" if case.get("rubric") else ""
     msgs = [{"role": "system", "content": JUDGE.format(rubric=rubric)},
             {"role": "user", "content": json.dumps({"request": case["text"], "assistant_message": replies[-1],

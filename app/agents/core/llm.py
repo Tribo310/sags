@@ -21,8 +21,9 @@ PROVIDERS = {  # name -> (base_url, api_key, model); a provider without a model 
 #   store         OpenAI: pricing within hard limits against competitor prices.
 #   judge         OpenAI: evals/ grades the agents with a different model than the ones being graded.
 #   scout         OpenAI: matching messy store listings (Mongolian, Russian, brands, pack sizes) to catalog items.
+#   clarifier     OyuLLM: is a Mongolian message clear enough to act on, and if not, the question to ask.
 ROLES = {"manager": "oyullm", "meal_planner": "oyullm", "procurement": "openai", "advisor": "openai", "store": "openai",
-         "judge": "openai", "scout": "openai"}
+         "judge": "openai", "scout": "openai", "clarifier": "oyullm"}
 LOCKED = {"manager"}  # can't be moved off OyuLLM with MODEL_<ROLE>
 
 _clients = {}

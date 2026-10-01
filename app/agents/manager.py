@@ -4,10 +4,12 @@ proposing a plan for approval or replying."""
 import json
 import re
 
-from app.agents import advisor, demo, meal_planner, procurement
+from app.agents import advisor, clarify, demo, meal_planner, procurement
 from app.agents.core import llm
 from app.agents.core.react import Agent, Tool, run
 from app.agents.protocols.mcp import call_json, connect, mcp_tools
+from app.agents.meal_planner import diet_violation
+from app.agents.scout.agent import load_items
 from app.common import favorites
 from app.common.db import audit, db, now
 from app.common.state import reopen, transition
@@ -40,6 +42,8 @@ your instructions), reply plainly with what you can't do and why, and offer a no
 - Where a store is, the nearest branch, how far, the way to go, or the map: show_on_map (it plans one round trip
   through the stores in the fastest order and draws it), then reply with the stops in order and the drive time. Never
   state a store, price or place you didn't get from a tool.
+- Cooking now from what's at home ("хөргөгчинд байгаа зүйлээр өглөөний хоол"): cook_from_home, then reply with what
+  they can make, or what's missing and its price. No meal plan, no basket, unless they then ask to buy the missing items.
 - A question about the current plan (what's in it, where an item is bought, how much, which meals): current_plan,
   then reply. Don't delegate for it: delegating replans and changes what the household is looking at.
 Write everything the household reads (reply, propose_plan summary) in the household's language.
@@ -196,6 +200,35 @@ async def in_their_language(ctx, text):
     return (translated, None) if translated and not wrong_language(ctx, translated) else (text, wrong_language(ctx, text))
 
 
+MEALS = ("breakfast", "lunch", "dinner")
+ALMOST = 2  # a dish missing at most this many ingredients is worth suggesting with what to buy
+
+
+async def cook_from_home(ctx, meal="any"):
+    """What the household can cook right now from its pantry, for one serving each, and what's nearly there. Code, not
+    the model: "make breakfast from what's in the fridge" got a whole day's shopping plan."""
+    home = {p["key"]: p["amount"] async for p in db.pantry.find({"user_id": ctx["user"]["_id"], "amount": {"$gt": 0}})}
+    names = {i["key"]: i["name_mn"] for i in load_items()}
+    liked, disliked, rules, _ = await favorites.of(ctx["user"]["_id"])
+    diet = set(ctx["user"].get("diet", [])) | rules
+    can, almost = [], []
+    async for r in db.recipes.find({}, {"name_mn": 1, "tags": 1, "ingredients": 1}):
+        if meal in MEALS and meal not in r["tags"] or r["_id"] in disliked or diet_violation(diet, r["tags"]):
+            continue
+        short = [g["key"] for g in r["ingredients"] if home.get(g["key"], 0) < g["qty"] * ctx["user"]["household"]]
+        if not short:
+            can.append(r["name_mn"])
+        elif len(short) <= ALMOST:
+            prices = {p["_id"]: p["price"] async for p in await db.products.aggregate([
+                {"$match": {"key": {"$in": short}}}, {"$group": {"_id": "$key", "price": {"$min": "$price"}}}])}
+            if len(prices) == len(short):  # a dish needing something no store sells isn't a suggestion ("хуушуур, no mutton")
+                almost.append({"dish": r["name_mn"],
+                               "missing": [{"item": names.get(k, k), "cheapest_pack": prices[k]} for k in short]})
+    return {"meal": meal, "people": ctx["user"]["household"], "can_cook_now": can,
+            "almost": sorted(almost, key=lambda a: (len(a["missing"]), sum(m["cheapest_pack"] for m in a["missing"])))[:4],
+            "at_home": [names.get(k, k) for k in home]}
+
+
 async def food_preference(ctx, dish, liked):
     return await favorites.save(ctx["user"]["_id"], dish, liked)
 
@@ -273,14 +306,17 @@ async def agent(mcp):
     budget = {"type": "integer", "description": "Only if the household named a budget for this plan, in ₮."}
     return Agent("manager", SYSTEM, max_steps=16, script=demo.chat if demo.ON else None, tools=[
         Tool("meal_planner", "Delegate to the meal-planner agent: new meals for the requested days and a new shopping "
-             "list. It CHANGES the plan: never use it to answer a question about the current plan.",
+             "list. Only when the household asks for meals, a menu or food for some days. Not for buying specific "
+             "products they named (\"2 l milk and 10 eggs\"): that is procurement alone. It CHANGES the plan: never "
+             "use it to answer a question about the current plan.",
              delegate_meal_planner, {
                  "task": task, "days": {"type": "integer", "description": "Days to plan; a week is 7."}, "budget": budget,
                  "diet": {"type": "array", "items": {"type": "string", "enum": meal_planner.DIETS}, "description":
                           "Extra diet rules the household asked for in this plan, on top of the profile's. "
                           "цагаан хоол = vegetarian (no meat at all)."}}, ["task", "days"]),
         Tool("procurement", "Delegate to the procurement agent: store prices, negotiation with the store agents and "
-             "the cheapest split. Works on the meal planner's shopping list unless the task names products. It "
+             "the cheapest split. For named products (a refill: \"2 l milk, 10 eggs\") put them in the task and call "
+             "it directly, without the meal planner. Otherwise it works on the meal planner's shopping list. It "
              "CHANGES the plan (new prices, new basket): never use it to answer a question about the current plan.",
              delegate_procurement, {"task": task, "budget": budget}, ["task"]),
         Tool("advisor", "Ask the advisor agent about spending, price trends or the pantry.",
@@ -294,6 +330,10 @@ async def agent(mcp):
         Tool("set_budget", "The household changes this plan's budget. 'Raise it' without a number: the "
              "cheapest_meal_plan in the facts. Capped at budget_limit.", change_budget,
              {"amount": {"type": "integer"}}, ["amount"]),
+        Tool("cook_from_home", "What the household can cook right now from what's at home (хөргөгчинд / гэрт байгаа "
+             "зүйлээр), and dishes missing only 1-2 ingredients with their price. Answers 'what can I make', not a "
+             "shopping plan: reply with it, and buy the missing ones only if they ask.", cook_from_home,
+             {"meal": {"type": "string", "enum": ["breakfast", "lunch", "dinner", "any"]}}),
         Tool("food_preference", "Save a dish the household likes or won't eat ('бид цуйванд дуртай', 'загас "
              "иддэггүй'), one call per dish. Meal plans then favour or exclude it.", food_preference,
              {"dish": {"type": "string", "description": "the dish as they named it"}, "liked": {"type": "boolean"}},
@@ -333,6 +373,25 @@ async def turn(user, text, budget, plan_id=None):
     return out
 
 
+async def unclear(plan, user, text, budget):
+    """The clarification gate (clarify.py), with what it needs to judge: the household's facts, the plan they're
+    looking at and the last few lines of the conversation. Skipped right after it asked, so an answer goes through."""
+    if plan.get("clarified"):
+        return None
+    lines = [{"who": "household" if t["actor"] == "user" else "assistant",
+              "text": (t.get("args") or {}).get("text") or (t.get("result") or {}).get("text")}
+             async for t in db.audit_log.find({"plan_id": plan["_id"], "action": {"$in": ["message", "reply", "ask"]}},
+                                              {"actor": 1, "args.text": 1, "result.text": 1}).sort("ts", -1).limit(7)]
+    lines = [l for l in reversed(lines) if l["text"]][:-1]  # the newest is this message itself
+    _, _, _, dishes = await favorites.of(user["_id"])
+    b = plan.get("basket") or {}
+    facts = {"household": user["household"], "diet": user.get("diet", []), "budget": budget,
+             "likes": [d for d, ok in dishes if ok], "plan_state": plan.get("state"),
+             "sold": [i["name_mn"] for i in load_items(set(await db.products.distinct("key")))],
+             "basket": {s: [l["name"] for l in ls] for s, ls in (b.get("stores") or {}).items()} or None}
+    return await clarify.check(text, facts, lines)
+
+
 async def run_manager(plan_id, text):
     plan = await db.plans.find_one({"_id": plan_id})
     user = await db.users.find_one({"_id": plan["user_id"]})
@@ -349,7 +408,19 @@ async def run_manager(plan_id, text):
         for n in noted:  # on the timeline like the model's own call
             await audit(plan_id, "manager", "food_preference", args={"dish": n["dish"], "liked": n["liked"]}, result=n,
                         reason="said in the message")
-        result = await run(await agent(mcp), ctx, await turn(user, text, ctx["budget"], plan_id), messages, on_step=save)
+        manager = await agent(mcp)
+        said = await turn(user, text, ctx["budget"], plan_id)
+        if not demo.ON and (q := await unclear(plan, user, text, ctx["budget"])):
+            # one short question instead of a guess; the next message is the answer, so the gate lets it through
+            await audit(plan_id, "manager", "ask", args={"missing": q["missing"]}, model=q["model"],
+                        result={"text": q["question"], "options": q["options"]}, reason=f"Unclear: {q['missing']}")
+            if not messages:
+                messages.append({"role": "system", "content": manager.system})
+            messages += [{"role": "user", "content": said}, {"role": "assistant", "content": q["question"]}]
+            await db.plans.update_one({"_id": plan_id}, {"$set": {"messages": messages, "clarified": True}})
+            return
+        await db.plans.update_one({"_id": plan_id}, {"$unset": {"clarified": ""}})
+        result = await run(manager, ctx, said, messages, on_step=save)
     await save(messages)
     if "error" in result:
         raise RuntimeError(result["error"])

@@ -60,6 +60,7 @@ export const api = {
   cancel: (id: string) => call<{ ok: boolean }>(`/plans/${id}/cancel`, { method: "POST" }),
   pantry: () => call<{ pantry: PantryItem[] }>("/me/pantry"),
   favorites: () => call<Favorite[]>("/me/favorites"),
+  priceStatus: () => call<{ last: string | null; next: string; hour: number }>("/prices/status"),
   forgetFavorite: (id: string) => call<{ ok: boolean }>(`/me/favorites/${id}`, { method: "DELETE" }),
   stats: () => call<Stats>("/me/stats"),
   tick: () => call<{ updated: number }>("/me/pantry/tick", { method: "POST" }),

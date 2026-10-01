@@ -79,3 +79,37 @@ def test_two_stores_agreeing_beat_the_guessed_catalog_price():
     unsure = [{"store": "nomin", "our_price": 11000, "status": "review", "price_only": False},
               {"store": "emart", "our_price": 12000, "status": "accepted"}]
     assert scout.corroborate(unsure)[0]["status"] == "review"  # held back for confidence, not price: stays
+
+
+def test_procurement_may_only_drop_or_swap_missing_items(monkeypatch):
+    from app.agents import procurement
+
+    class Plans:
+        async def find_one(self, *a, **k):
+            return {"shopping_list": {"items": [{"key": "beans_can", "amount": 1}]}, "needed": {"beans_can": 1, "oats": 1},
+                    "basket": {"missing": ["oats"]}}
+
+    class DB:
+        plans = Plans()
+    monkeypatch.setattr(procurement, "db", DB())
+    ctx = {"plan_id": "p", "user": {"policy": {}}}
+    r = asyncio.run(procurement.quote_stores(ctx, swap=[{"from": "beans_can", "to": "turnip"}]))
+    assert "error" in r and "beans_can" in r["error"]
+    r = asyncio.run(procurement.quote_stores(ctx, drop=["beans_can"]))
+    assert "error" in r
+
+
+def test_policy_counts_weighed_food_in_kilos():
+    from app.agents.procurement import policy_qty
+    assert policy_qty({"qty": 15, "pack": 0.1}) == 2  # 1.5 kg of apples is 2 kg-ish, not 15 "packs"
+    assert policy_qty({"qty": 3, "pack": 0.91}) == 3  # milk cartons stay packs
+    assert policy_qty({"qty": 12, "pack": 1}) == 12
+
+
+def test_bulk_packs_go_to_review():
+    butter = {"key": "butter", "name_mn": "Цөцгийн тос", "name_en": "Butter", "category": "dairy", "unit": "kg", "pack": 0.2,
+              "price": 5800}
+    ctx = {"item": butter, "decided": {}, "shown": {"nomin": {"n0": {"store": "nomin", "sku": "1", "name": "President 1 кг",
+           "price": 81080, "in_stock": True, "stock": 9, "pack_hint": ""}}}}
+    r = asyncio.run(scout.record_match(ctx, "nomin", "n0", 1.0, 0.95))
+    assert r["status"] == "review" and "bulk" in r["why_review"]

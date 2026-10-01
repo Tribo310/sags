@@ -21,7 +21,8 @@
     "expect": {
       "outcome_any": [
         "plan",
-        "reply"
+        "reply",
+        "ask"
       ],
       "days": 3,
       "no_tags": [
@@ -122,5 +123,80 @@
         "pork"
       ]
     }
+  },
+  {
+    "id": "off_topic",
+    "text": "Монголын ерөнхийлөгч хэн бэ?",
+    "expect": {
+      "outcome": "reply",
+      "not_agents": [
+        "meal_planner",
+        "procurement",
+        "advisor"
+      ],
+      "no_payment": true
+    },
+    "rubric": "Off-topic for a grocery assistant. A good answer (fulfils=true) says briefly and politely that it helps with groceries and meal plans, offers that help, and does not answer or invent facts about the question itself."
+  },
+  {
+    "id": "cook_from_home",
+    "text": "Өглөөний хоолоо хөргөгчинд байгаа зүйлээр хийе",
+    "expect": {
+      "outcome": "reply",
+      "not_agents": [
+        "meal_planner",
+        "procurement"
+      ],
+      "no_payment": true
+    },
+    "rubric": "The household wants to cook breakfast from what is already at home. A good answer says what they can make now from it, or honestly that nothing fits completely and which one or two items are missing (with their price), and offers to buy them. Proposing a whole shopping plan is a failure."
+  },
+  {
+    "id": "vague_meat",
+    "text": "мах авмаар байна",
+    "expect": {
+      "outcome": "ask",
+      "not_agents": [
+        "meal_planner",
+        "procurement"
+      ]
+    },
+    "rubric": "The message is too vague or ambiguous to act on. A good answer (fulfils=true) asks one short, relevant question about what is missing, in Mongolian, and does not plan, buy or invent anything yet."
+  },
+  {
+    "id": "vague_food",
+    "text": "хүнс",
+    "expect": {
+      "outcome": "ask",
+      "not_agents": [
+        "meal_planner",
+        "procurement"
+      ]
+    },
+    "rubric": "The message is too vague or ambiguous to act on. A good answer (fulfils=true) asks one short, relevant question about what is missing, in Mongolian, and does not plan, buy or invent anything yet."
+  },
+  {
+    "id": "vague_guests",
+    "text": "маргааш зочид ирнэ",
+    "expect": {
+      "outcome": "ask",
+      "not_agents": [
+        "meal_planner",
+        "procurement"
+      ]
+    },
+    "rubric": "The message is too vague or ambiguous to act on. A good answer (fulfils=true) asks one short, relevant question about what is missing, in Mongolian, and does not plan, buy or invent anything yet."
+  },
+  {
+    "id": "vague_that",
+    "text": "тэрийг нь авъя",
+    "expect": {
+      "outcome": "ask",
+      "not_agents": [
+        "meal_planner",
+        "procurement"
+      ]
+    },
+    "rubric": "The message is too vague or ambiguous to act on. A good answer (fulfils=true) asks one short, relevant question about what is missing, in Mongolian, and does not plan, buy or invent anything yet."
   }
 ]

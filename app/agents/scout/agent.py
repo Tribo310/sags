@@ -22,6 +22,7 @@ PLAUSIBLE = (1 / 5, 10)
 KEYWORD_POOL = 100  # candidates the keyword filter keeps before the embedding ranks them (ties are common)
 SHOWN = 8  # candidates the model sees per store
 WEIGHT_STEP = 0.1  # kg: a product sold by weight is bought in 100 g steps, not whole kilos
+BULK = 3  # a pack this many times our usual household pack goes to review
 
 SYSTEM = """You match one grocery item from our catalog to real products in two Mongolian stores' listings.
 For each store (nomin, emart): call candidates, then record_match for the right one or no_match. Then finish.
@@ -30,7 +31,8 @@ Rules:
   condensed); flour = wheat flour; beef = beef meat (not sausage, jerky, dumplings); a dish or a snack that contains
   the item is not the item.
 - Any pack size is fine: the store sells its own packs and we buy as many as needed. Never reject a candidate for
-  its size. Prefer the most common household pack and an ordinary brand over premium or bulk. A special variety (rye or
+  its size, but pick the household-size pack (near our usual pack in the task) over a bulk one, and an ordinary brand
+  over premium. A special variety (rye or
   whole-grain flour, flavoured, organic, omega-3) only if our item names it or nothing plain is there.
 - pack_in_our_unit: the candidate's package size in OUR unit (given in the task). Read it from the name or pack_hint:
   "1л" milk -> 1 (unit l); "910гр" milk -> 0.91 (dairy: 1 g ~ 1 ml); "500г" sausage -> 0.5 (unit kg); eggs sold as
@@ -91,15 +93,19 @@ async def record_match(ctx, store, id, pack_in_our_unit, confidence, reason=""):
     our_price = round(p["price"] * item["pack"] / pack / 10) * 10  # the candidate's price for one of OUR packs
     ratio = our_price / item["price"]
     sure, plausible = float(confidence) >= MIN_CONFIDENCE, PLAUSIBLE[0] <= ratio <= PLAUSIBLE[1]
-    status = "accepted" if sure and plausible else "review"
+    # A bulk pack makes every small recipe pay for it: 1 kg of butter (81,000₮) for 40 g in a breakfast.
+    bulk = pack > BULK * item["pack"] and not p.get("by_weight")
+    status = "accepted" if sure and plausible and not bulk else "review"
     ctx["decided"][store] = {"store": store, "key": item["key"], "sku": p["sku"], "name": p["name"],
                              "pack_in_our_unit": pack, "store_price": p["price"], "our_price": our_price,
                              "in_stock": p["in_stock"], "stock": p["stock"], "url": p.get("url"),
                              "by_weight": bool(p.get("by_weight")),
                              "confidence": float(confidence), "reason": reason, "status": status,
-                             "price_only": sure and not plausible}
+                             "price_only": sure and not plausible and not bulk}
     return {"status": status, "our_price": our_price,
-            **({"why_review": f"price {our_price} is {ratio:.1f}x our catalog's {item['price']}",
+            **({"why_review": f"bulk pack ({pack} {item['unit']}). If another candidate is the same product in a "
+                              f"household size (about {item['pack']} {item['unit']}), record_match that one instead"
+                              if bulk else f"price {our_price} is {ratio:.1f}x our catalog's {item['price']}",
                 "note": "recorded for a person to review; this store is decided, move on"}
                if status == "review" else {})}
 
@@ -139,14 +145,47 @@ def _upsert(p):
 
 async def match_item(ctx, item):
     c = {**ctx, "item": item, "shown": {}, "decided": {}}
-    task = (f"Our item: {item['name_mn']} ({item['name_en']}), category {item['category']}. "
-            f"Our unit: {item['unit']} (give pack_in_our_unit in {item['unit']}; any pack size is fine).")
-    try:
-        await run(agent(), c, task)
-    except Exception as e:
-        await audit(ctx["plan_id"], "scout", "error", result={"error": f"{item['key']}: {e!r}"})
-    return corroborate([c["decided"].get(s) or {"store": s, "key": item["key"], "status": "none", "reason": "undecided"}
-                        for s in STORES])
+    for store in STORES:  # the candidates first: they're the cache key
+        await candidates(c, store)
+    seen = {s: sorted(p["sku"] for p in c["shown"][s].values()) for s in STORES}
+    if not ctx.get("fresh") and await reuse(c, seen):
+        c["cached"] = True
+    else:
+        task = (f"Our item: {item['name_mn']} ({item['name_en']}), category {item['category']}. "
+                f"Our unit: {item['unit']} (give pack_in_our_unit in {item['unit']}); a usual household pack is about "
+                f"{item['pack']} {item['unit']}.")
+        try:
+            await run(agent(), c, task)
+            await remember_decisions(c, seen)
+        except Exception as e:
+            await audit(ctx["plan_id"], "scout", "error", result={"error": f"{item['key']}: {e!r}"})
+    out = corroborate([c["decided"].get(s) or {"store": s, "key": item["key"], "status": "none", "reason": "undecided"}
+                       for s in STORES])
+    return [{**m, "cached": bool(c.get("cached"))} for m in out]
+
+
+async def reuse(c, seen):
+    """Yesterday's decisions, when both stores show exactly the same candidates: the model would decide the same, so
+    only the facts are refreshed. Prices, stock, plausibility and the bulk check run again on today's data."""
+    cached = {d["store"]: d async for d in db.scout_cache.find({"key": c["item"]["key"]})}
+    if any(cached.get(s, {}).get("skus") != seen[s] for s in STORES):
+        return False
+    for s in STORES:
+        d = cached[s]
+        if d.get("sku"):
+            cid = next(i for i, p in c["shown"][s].items() if p["sku"] == d["sku"])
+            await record_match(c, s, cid, d["pack_in_our_unit"], d["confidence"], d.get("reason", ""))
+        else:
+            await no_match(c, s, d.get("reason") or "no candidate fits")
+    return True
+
+
+async def remember_decisions(c, seen):
+    for s, d in c["decided"].items():
+        await db.scout_cache.replace_one({"_id": f"{c['item']['key']}:{s}"}, {
+            "key": c["item"]["key"], "store": s, "skus": seen[s], "sku": d.get("sku"),
+            "pack_in_our_unit": d.get("pack_in_our_unit"), "confidence": d.get("confidence"),
+            "reason": d.get("reason", ""), "ts": now()}, upsert=True)
 
 
 def corroborate(decided, within=3):
@@ -198,7 +237,7 @@ async def apply(matches, items):
     return {"real": len(real), "removed": len(gone)}
 
 
-async def scout(items, crawl=True, write=True, parallel=4, from_run=None, log=print):
+async def scout(items, crawl=True, write=True, parallel=4, from_run=None, fresh=False, log=print):
     if from_run:  # reuse an earlier run's matches (no crawling, no LLM)
         matches = [m async for m in db.crawl_matches.find({"run_id": from_run, "key": {"$in": [i["key"] for i in items]}},
                                                           {"_id": 0})]
@@ -206,7 +245,7 @@ async def scout(items, crawl=True, write=True, parallel=4, from_run=None, log=pr
         return {"run_id": from_run, "items": len(items), "applied": applied,
                 **{s: sum(1 for m in matches if m["status"] == s) for s in ("accepted", "review", "none")}}, matches
     run_id = uuid.uuid4().hex[:8]
-    ctx = {"plan_id": f"scout:{run_id}", "emart_lock": asyncio.Lock()}
+    ctx = {"plan_id": f"scout:{run_id}", "emart_lock": asyncio.Lock(), "fresh": fresh}
     async with sources.client() as h:
         ctx["http"] = h
         if crawl:
@@ -227,6 +266,7 @@ async def scout(items, crawl=True, write=True, parallel=4, from_run=None, log=pr
     await db.crawl_matches.insert_many([{**m, "run_id": run_id, "ts": now()} for m in matches])
     applied = await apply(matches, items) if write else {}
     summary = {"run_id": run_id, "items": len(items), "applied": applied,
+               "reused_decisions": sum(1 for m in matches if m.get("cached")) // len(STORES),
                **{s: sum(1 for m in matches if m["status"] == s) for s in ("accepted", "review", "none")}}
     await audit(ctx["plan_id"], "scout", "summary", result=summary)
     return summary, matches

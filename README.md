@@ -86,6 +86,18 @@ uv run --env-file .env python -m app.agents.scout             # crawl + match + 
 
 Raw listings are stored in `crawl_raw`, and every decision (with the agent's reason) in `crawl_matches`.
 
+**It runs by itself once a day.** Every planner process checks every 10 minutes whether today's run (at
+`SCOUT_HOUR`, default 03:00 Ulaanbaatar time) is done. A lock document in MongoDB lets exactly one process crawl, and
+`scout_runs` records each run, so it runs once a day even with several planners on a shared database. A day missed
+while everything was down is caught up by the next planner that starts. The basket shows when the prices were
+last refreshed. `SCOUT_DAILY=0` turns it off for a process.
+
+**Caches (exact keys, never semantic).** The scout reuses yesterday's decision for an item when both stores show the
+same candidates, with today's prices and checks (`--fresh` decides again). The meal planner reuses the dishes of an
+earlier plan when the household's words, numbers, diet, favourites, pantry and price date are all identical; the list
+and budget check are rebuilt now (`plan_cache`, 2-day TTL). A semantic cache was measured and rejected: "60 мянга"
+and "6 мянга", or "авмаар" and "авмааргүй", embed closer (0.94) than two phrasings of one question.
+
 ## Evaluation
 
 `evals/cases.json` holds scenarios: a week plan, a stated budget, a vegetarian week, a refill, a price question, a

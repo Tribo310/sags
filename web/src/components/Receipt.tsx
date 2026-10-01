@@ -1,7 +1,9 @@
 import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useState } from "react";
 
+import { api } from "../api";
 import { stateName, storeName } from "../i18n";
-import type { Plan } from "../types";
+import type { Dish, Plan } from "../types";
 import Num from "./Num";
 
 interface Props {
@@ -18,6 +20,7 @@ const print = { initial: { opacity: 0, y: -4 }, animate: { opacity: 1, y: 0 }, e
 
 /** The basket: lines print in, totals count, the budget bar fills. Approve lives in the workspace footer. */
 export default function Receipt({ plan, running, stores, onCancel }: Props) {
+  const [dish, setDish] = useState<string | null>(null);  // a dish picked: its ingredients light up in the basket
   const b = plan?.basket;
   const budget = plan?.budget;
   const over = !!(b && budget && b.total > budget);
@@ -30,6 +33,7 @@ export default function Receipt({ plan, running, stores, onCancel }: Props) {
     return (
       <section className="section receipt" aria-label="Сагс">
         <h2>Таны сагс</h2>
+        <PricesAsOf />
         {plan?.summary && <p className="summary">{plan.summary}</p>}
         {running ? (
           <>
@@ -55,6 +59,7 @@ export default function Receipt({ plan, running, stores, onCancel }: Props) {
         <h2>Таны сагс</h2>
         <span className="pill st" data-s={plan!.state}>{label}</span>
       </div>
+      <PricesAsOf />
 
       {paid && (
         <motion.div className="orders" {...print}>
@@ -70,13 +75,16 @@ export default function Receipt({ plan, running, stores, onCancel }: Props) {
       )}
       {plan?.summary && <motion.p className="summary" {...print}>{plan.summary}</motion.p>}
 
+      {!!plan?.dishes?.length && <Dishes dishes={plan.dishes} picked={dish} onPick={setDish} />}
+
       <AnimatePresence initial={false}>
         {Object.entries(b.stores).map(([store, lines], si) => (
           <motion.div className="store" key={store} layout {...print}>
             <h3><span>{storeName(store)}</span><Num value={lines.reduce((s, l) => s + l.line_total, 0)} /></h3>
             <AnimatePresence initial={false}>
               {lines.map((l, i) => (
-                <motion.div className="line" key={l.key} {...print} transition={{ delay: 0.15 * si + 0.03 * i }}>
+                <motion.div key={l.key} {...print} transition={{ delay: 0.15 * si + 0.03 * i }}
+                  className={`line${dish ? (usedBy(plan?.dishes, dish).has(l.key) ? " used" : " dim") : ""}`}>
                   <span>{l.name}</span><span className="num q">×{l.qty}</span><Num value={l.line_total} />
                 </motion.div>
               ))}
@@ -108,5 +116,63 @@ export default function Receipt({ plan, running, stores, onCancel }: Props) {
         </button>
       )}
     </section>
+  );
+}
+
+const UB = (iso: string) => new Date(iso).toLocaleString("mn-MN", {
+  timeZone: "Asia/Ulaanbaatar", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+});
+
+/** Where the prices come from: the price scout refreshes the stores' real prices once a day on its own. */
+function PricesAsOf() {
+  const [s, setS] = useState<{ last: string | null; next: string } | null>(null);
+  useEffect(() => { api.priceStatus().then(setS, () => {}); }, []);
+  if (!s?.last) return null;
+  return (
+    <p className="asof" title={`Дараагийн шинэчлэл: ${UB(s.next)}`}>
+      Номин, Имартын бодит үнэ · {UB(s.last)}-ийн байдлаар · өдөр бүр шинэчлэгдэнэ
+    </p>
+  );
+}
+
+const MEAL: Record<string, string> = { breakfast: "өглөө", lunch: "өдөр", dinner: "орой" };
+
+/** "1, 2, 3-р өдөр орой": the days a dish is eaten, grouped by meal. */
+function when(d: Dish) {
+  const by: Record<string, number[]> = {};
+  for (const w of d.when) (by[w.meal] ??= []).push(w.day);
+  return Object.entries(by).map(([meal, days]) => `${days.join(", ")}-р өдөр ${MEAL[meal] ?? meal}`).join(" · ");
+}
+
+const usedBy = (dishes: Dish[] | undefined, name: string) =>
+  new Set((dishes ?? []).find((d) => d.name === name)?.ingredients.map((g) => g.key) ?? []);
+
+/** What the basket cooks: one card per dish; picking one lights up its ingredients in the store lines below. */
+function Dishes({ dishes, picked, onPick }: { dishes: Dish[]; picked: string | null; onPick: (d: string | null) => void }) {
+  return (
+    <div className="dishes">
+      <h3>Энэ сагсаар хийх хоол <span className="hint">· дарж найрлагыг харна</span></h3>
+      <ul>
+        {dishes.map((d) => (
+          <li key={d.name}>
+            <button type="button" className={`dish${picked === d.name ? " on" : ""}`} aria-pressed={picked === d.name}
+              onClick={() => onPick(picked === d.name ? null : d.name)}>
+              <span className="dname">{d.name}<span className="times num">×{d.when.length}</span>
+                <span className="dwhen">{when(d)}</span></span>
+              {picked === d.name && (
+                <span className="ings">
+                  {d.ingredients.map((g) => (
+                    <span key={g.key} className={`ing ${g.status}`}
+                      title={g.status === "home" ? "гэрт байгаа" : g.status === "bought" ? "сагсанд" : "сагсанд ч, гэрт ч алга"}>
+                      {g.name}{g.status === "home" && <i> · гэрт</i>}{g.status === "none" && <i> · алга</i>}
+                    </span>
+                  ))}
+                </span>
+              )}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from app.common.db import agg, audit, db, now
 from app.common.state import StateConflict, reopen, transition
 from app.agents.manager import run_manager
+from app.agents.scout import schedule as scout_schedule
 from app.agents.protocols import a2a as stores
 from app.agents.protocols.mcp import call_json, connect
 from app.planner.auth import current_user, router as auth_router
@@ -65,9 +66,13 @@ async def keep_leases():
 async def lifespan(app):
     print("store agents:", await stores.discover())
     await reclaim()
-    task = asyncio.create_task(keep_leases())
+    await db.plan_cache.create_index("ts", expireAfterSeconds=2 * 86400)  # reused meal choices age out
+    tasks = [asyncio.create_task(keep_leases())]
+    if os.getenv("SCOUT_DAILY", "1") == "1":  # real prices refresh themselves once a day (one process does it)
+        tasks.append(asyncio.create_task(scout_schedule.daily()))
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -161,9 +166,35 @@ async def list_plans(uid: Uid):
     ])
 
 
+MEAL_ORDER = {"breakfast": 0, "lunch": 1, "dinner": 2}
+ITEM_NAMES = {i["key"]: i["name_mn"] for i in json.loads((Path(__file__).parents[2] / "seed" / "items.json").read_text())}
+
+
+async def dishes_of(plan):
+    """The dishes this plan cooks, each with when it's eaten and its ingredients: bought (the basket's line), at home
+    (the pantry covers it) or neither. Built from the plan's meals, so older plans get it too."""
+    meals = plan.get("meals") or []
+    if not meals:
+        return []
+    recipes = {r["name_mn"]: r async for r in db.recipes.find({"name_mn": {"$in": list({m["recipe"] for m in meals})}},
+                                                               {"name_mn": 1, "ingredients": 1})}
+    bought = {l["key"]: l["name"] for ls in ((plan.get("basket") or {}).get("stores") or {}).values() for l in ls}
+    home = {p["key"] for p in (plan.get("shopping_list") or {}).get("from_pantry", [])}
+    out = {}
+    for m in sorted(meals, key=lambda m: (m["day"], MEAL_ORDER.get(m["meal"], 3))):
+        d = out.setdefault(m["recipe"], {"name": m["recipe"], "when": [], "ingredients": [
+            {"key": g["key"], "name": bought.get(g["key"]) or ITEM_NAMES.get(g["key"], g["key"]),
+             "status": "bought" if g["key"] in bought else "home" if g["key"] in home else "none"}
+            for g in (recipes.get(m["recipe"]) or {}).get("ingredients", [])]})
+        d["when"].append({"day": m["day"], "meal": m["meal"]})
+    return list(out.values())
+
+
 @app.get("/plans/{pid}")
 async def get_plan(pid: str, uid: Uid):
-    return await own_plan(pid, uid, {"messages": 0, "quotes": 0})
+    plan = await own_plan(pid, uid, {"messages": 0, "quotes": 0})
+    plan["dishes"] = await dishes_of(plan)
+    return plan
 
 
 async def plan_events(pid):
@@ -294,6 +325,12 @@ async def agent_metrics(_: Uid, hours: int = 24):
 @app.get("/me/stats")
 async def stats(uid: Uid):
     return await mcp_tool("spending_stats", {"user_id": uid})
+
+
+@app.get("/prices/status")
+async def prices_status(_: Uid):
+    """When the price scout last refreshed the real prices, and when it runs next."""
+    return await scout_schedule.status()
 
 
 @app.get("/me/favorites")

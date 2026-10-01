@@ -75,6 +75,8 @@ export function describe(ev: AuditEvent): [string, string] {
     case "nearest_branches": return ["Ойрын салбар хайлаа", ""];
     case "get_route": return ["Зам тооцлоо", r.km ? `${r.km} км, ${r.minutes} мин` : ""];
     case "remember": return ["Санаж авлаа", a.fact];
+    case "cook_from_home": return ["Гэрт байгаагаар юу хийхийг шалгалаа", r.can_cook_now?.length
+      ? `хийж болно: ${r.can_cook_now.join(", ")}` : r.almost?.length ? `бараг: ${r.almost.map((a: { dish: string }) => a.dish).join(", ")}` : "тохирох хоол алга"];
     case "food_preference": return [a.liked ? "Дуртай хоол хадгаллаа" : "Идэхгүй хоол хадгаллаа",
       r.diet_rule ? `${a.dish}: орсон жор бүрийг хасна` : r.recipe ? `${a.dish} → ${r.recipe}` : a.dish];
     case "spending_stats": return ["Зарцуулалтаа харлаа", ""];

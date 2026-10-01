@@ -61,6 +61,14 @@ export interface Plan {
   trip?: Trip | null;
   receipts?: Receipt[];
   error?: string | null;
+  dishes?: Dish[];
+}
+
+/** A dish the plan cooks: when it's eaten, and each ingredient bought in the basket, at home, or neither. */
+export interface Dish {
+  name: string;
+  when: { day: number; meal: "breakfast" | "lunch" | "dinner" | string }[];
+  ingredients: { key: string; name: string; status: "bought" | "home" | "none" }[];
 }
 
 export interface PantryItem {

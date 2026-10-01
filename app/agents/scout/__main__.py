@@ -7,6 +7,7 @@ import argparse
 import asyncio
 
 from app.agents.scout.agent import load_items, scout
+from app.common.db import db, now
 
 
 async def main():
@@ -15,9 +16,15 @@ async def main():
     ap.add_argument("--no-crawl", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--from-run", default="", help="apply an earlier run's matches instead of matching again")
+    ap.add_argument("--fresh", action="store_true", help="let the agent decide again even where yesterday's candidates "
+                                                         "are unchanged (ignores the decision cache)")
     a = ap.parse_args()
     items = load_items(set(a.items.split(",")) - {""})
-    summary, matches = await scout(items, crawl=not a.no_crawl, write=not a.dry_run, from_run=a.from_run or None)
+    started = now()
+    summary, matches = await scout(items, crawl=not a.no_crawl, write=not a.dry_run, from_run=a.from_run or None,
+                                   fresh=a.fresh)
+    if not a.dry_run and not a.items and not a.from_run:  # a full manual run counts as the day's run
+        await db.scout_runs.insert_one({"ts": started, "finished": now(), "ok": True, "summary": summary, "manual": True})
     review = [m for m in matches if m["status"] == "review"]
     if review:
         print("\nto review (not applied):")
