@@ -1,33 +1,96 @@
 # Сагс — agentic grocery shopping
 
-Budget + days + household → meal plan → grocery list → live quotes from 3 store agents (A2A) → cheapest split →
-user approval → sandbox checkout (reserve → hold → order → capture) with receipts, cancel/refund and a full audit log.
+Tell it, in Mongolian, what you need: *"7 хоногийн хүнсний жагсаалт гарга. 150 мянган төгрөг, 2 хүн, гахайн мах
+иддэггүй."* (a week of groceries, 150k ₮, 2 people, no pork). A team of agents takes it from there:
 
-## Layout
+1. **Manager** reads the request and the household profile, and splits the work.
+2. **Meal planner** plans 3 meals for every day from the recipe base (skipping what the pantry already has) and builds
+   the shopping list.
+3. **Procurement** asks 3 store agents (nomin, emart, sansar) for quotes over **A2A**, negotiates discounts with each
+   store's own sales agent, and picks the cheapest split across stores.
+4. You get a plan with the basket, prices and savings. **Approve** it.
+5. **Checkout** (plain code, no LLM) runs a saga per store: reserve stock → wallet hold → place order → capture. A
+   failure at any step rolls back. You get receipts, can cancel/refund, and see a pickup trip through the stores on
+   a map.
 
+The manager remembers what the household says it likes or won't eat ("цуйван дуртай", "загас иддэггүй") and the
+meal planner honours it. You can talk to it by voice and have replies read aloud. Every agent step is logged to an
+audit trail and streamed live to the UI. Store prices are real, collected by the price scout (below).
+
+| Requirement | Where |
+|---|---|
+| Agentic behaviour | ReAct loop for every agent (`app/agents/core/react.py`), manager delegating to sub-agents |
+| MongoDB | Atlas Local: vector search (recipes, products), transactions (checkout), change streams (live UI, price alerts), TTL (offers, unpaid reservations), time series (price history) |
+| MCP | `grocery-mcp` (`app/mcp_server.py`): profile, recipes, products, list, pantry, spending, price history, branches, routes, trip, policy-guarded wallet |
+| Agent2Agent | Store agents (`app/agents/store/server.py`) with agent cards: quote · negotiate · reserve · order · cancel |
+
+## Setup
+
+Needs Python 3.13 + [uv](https://docs.astral.sh/uv/), Node + npm, Docker and [Ollama](https://ollama.com).
+
+```bash
+cp .env.example .env
+uv sync
+ollama pull bge-m3 && ollama pull qwen3:8b    # embeddings + local fallback LLM
+docker compose up -d                          # MongoDB Atlas Local on :27018
+uv run --env-file .env python -m seed.seed    # catalog, recipes, branches, indexes
 ```
-app/
-  agents/                 every agent, in one place
-    core/react.py         ReAct loop shared by all agents: Thought -> Action -> Observation until a final tool
-    core/llm.py           which LLM each agent uses (manager: always OyuLLM), with fallback
-    protocols/a2a.py      A2A client: discovers store agents from their agent cards, sends them tasks
-    protocols/mcp.py      MCP client: grocery-mcp tools as ReAct tools
-    manager.py            Manager: talks to the household, orchestrates the sub-agents
-    meal_planner.py       Sub-agent: meals for every day + shopping list
-    procurement.py        Sub-agent: store quotes + negotiation over A2A, cheapest split
-    advisor.py            Sub-agent: spending, price trends, pantry questions
-    demo.py               DEMO=1 scripts standing in for each agent's LLM
-    store/server.py       A2A store agent (run once per store: STORE=nomin PORT=9101)
-    store/negotiator.py   the store's own sales agent (ReAct) behind the negotiate skill
-    store/policy.py       each store's negotiation limits, enforced in code
-  common/                 db (Mongo helpers), policy, state machine, optimizer, embed
-  mcp_server.py           grocery-mcp: profile, recipes, list, branches, routes, policy-guarded wallet
-  planner/                FastAPI app: HTTP/SSE API, auth, checkout saga
-web/                      single-page UI
-seed/                     catalog, recipes, branches + seed.py
-scripts/                  probes, e2e demo, chaos (force out-of-stock), price (change a price -> alert)
-tests/                    pure-logic tests (no services needed)
+
+Optional, for real store prices instead of the seeded ones: `uv run --env-file .env python -m app.agents.scout` (see
+[the price scout](#real-prices-the-price-scout)).
+
+Fill in `.env` (everything else has working defaults):
+
+| Variable | |
+|---|---|
+| `LLM_API_KEY` | OyuLLM key. The manager and meal planner always use it. |
+| `OPENAI_API_KEY` | Optional. Procurement, advisor and store negotiators use OpenAI; empty → they use OyuLLM. |
+| `JWT_SECRET` | Required, ≥ 32 chars: `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `OYUVOICE_API_KEY` | Optional, voice input (speech to text) and spoken replies. The OyuLLM key works. `TTS_VOICE` picks the voice. |
+| `EMBED_API_KEY` | Optional. Set it with `EMBED_BASE_URL=https://api.oyu.so/v1` to get bge-m3 embeddings from the oyu API instead of local Ollama (same vectors, faster). |
+| `MONGO_URL` | Defaults to the local container. An Atlas URL works too. |
+
+Check the LLM providers and embeddings answer: `uv run --env-file .env python -m scripts.check_llm`.
+
+## Run
+
+```bash
+./run.sh            # open http://localhost:8000, sign up, chat
 ```
+
+`run.sh` starts Mongo (when `MONGO_URL` is local) and Ollama if they're down, rebuilds `web/` when its sources
+changed, then starts:
+
+| Service | Port |
+|---|---|
+| grocery-mcp (MCP server) | 8100 |
+| store agents nomin / emart / sansar (A2A) | 9101 / 9102 / 9103 |
+| planner (API + UI) | 8000 |
+
+Ctrl-C stops everything. Services bind to localhost; `HOST=0.0.0.0` exposes them (the MCP and store agents have no
+auth).
+
+- **Demo mode:** `DEMO=1 ./run.sh` reseeds the DB and swaps every LLM for a deterministic script
+  (`app/agents/demo.py`). Same tools, same ReAct steps, no API keys used: safe for a live demo.
+- **Frontend dev:** with `run.sh` up, `cd web && npm run dev` serves the UI on :5173 with hot reload, proxying API
+  calls to :8000.
+
+### Things to try
+
+```bash
+uv run --env-file .env python -m scripts.price emart milk 3000   # price drop -> alert in chat
+uv run --env-file .env python -m scripts.chaos emart milk        # sold out at one store -> checkout reroutes
+uv run --env-file .env python -m scripts.chaos all milk          # sold out everywhere -> agent replans
+```
+
+Unpaid reservations expire after `RESERVE_TTL` seconds (default 900, set at seed) and are restocked.
+
+### API
+
+`POST /chat` (start or continue a plan) · `GET /plans`, `GET /plans/{id}` · `POST /plans/{id}/approve` ·
+`POST /plans/{id}/cancel` · `GET /me/stream` (SSE: agent steps, plan updates, alerts) · `GET /me/stats`,
+`GET /me/pantry` · `GET /me/favorites`, `DELETE /me/favorites/{id}` · `POST /stt`, `POST /tts` (voice) ·
+`GET /metrics/agents`. All need a login cookie (`/auth/*`).
 
 ## Agents
 
@@ -86,6 +149,33 @@ uv run --env-file .env python -m app.agents.scout             # crawl + match + 
 
 Raw listings are stored in `crawl_raw`, and every decision (with the agent's reason) in `crawl_matches`.
 
+## Layout
+
+```
+app/
+  agents/                 every agent, in one place
+    core/react.py         ReAct loop shared by all agents: Thought -> Action -> Observation until a final tool
+    core/llm.py           which LLM each agent uses (manager: always OyuLLM), with fallback
+    protocols/a2a.py      A2A client: discovers store agents from their agent cards, sends them tasks
+    protocols/mcp.py      MCP client: grocery-mcp tools as ReAct tools
+    manager.py            Manager: talks to the household, orchestrates the sub-agents
+    meal_planner.py       Sub-agent: meals for every day + shopping list
+    procurement.py        Sub-agent: store quotes + negotiation over A2A, cheapest split
+    advisor.py            Sub-agent: spending, price trends, pantry questions
+    scout/                Price scout: crawls real store listings, matches them to the catalog (CLI)
+    demo.py               DEMO=1 scripts standing in for each agent's LLM
+    store/server.py       A2A store agent (run once per store: STORE=nomin PORT=9101)
+    store/negotiator.py   the store's own sales agent (ReAct) behind the negotiate skill
+    store/policy.py       each store's negotiation limits, enforced in code
+  common/                 db (Mongo helpers), policy, state machine, optimizer, embed, favorites
+  mcp_server.py           grocery-mcp: profile, recipes, list, branches, routes, policy-guarded wallet
+  planner/                FastAPI app: HTTP/SSE API, auth, checkout saga
+web/                      single-page UI
+seed/                     catalog, recipes, branches + seed.py
+scripts/                  probes, e2e demo, chaos (force out-of-stock), price (change a price -> alert)
+tests/                    pure-logic tests (no services needed)
+```
+
 ## Evaluation
 
 `evals/cases.json` holds scenarios: a week plan, a stated budget, a vegetarian week, a refill, a price question, a
@@ -114,19 +204,8 @@ What moved the numbers: facts injected instead of guessed, tools whose arguments
 key checks), one `plan_meals` tool instead of servings maths plus a 21-entry list, compact tool results, and code
 guards on budget, diet and coverage. The judge's own noise (gpt-4o-mini in Mongolian) is the main remaining variance.
 
-## Run
+## Tests
 
 ```bash
-cp .env.example .env              # fill in OyuLLM / OyuVoice
-docker compose up -d              # MongoDB Atlas Local (vector search, transactions, change streams)
-OLLAMA_CONTEXT_LENGTH=32768 ollama serve &
-ollama pull bge-m3 && ollama pull qwen3:8b
-uv sync
-uv run --env-file .env python -m seed.seed
-./run.sh                          # http://localhost:8000
-uv run python scripts/demo_e2e.py # end-to-end check
-uv run pytest -q
+uv run pytest -q    # pure logic: optimizer, policy, state machine, checkout, auth, ReAct loop, scout, favorites... no services needed
 ```
-
-Demo price drop: `uv run --env-file .env python -m scripts.price emart milk 3000` (alert in chat).
-Unpaid reservations expire after `RESERVE_TTL` seconds (default 900, set at seed) and are restocked.
